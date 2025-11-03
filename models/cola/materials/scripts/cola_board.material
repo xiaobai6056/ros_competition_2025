@@ -1,0 +1,15 @@
+material cola
+{
+    technique
+    {
+        pass
+        {
+            texture_unit
+            {
+                texture cola.png
+                scale 1 1
+                rotate 90
+            }
+        }
+    }
+}

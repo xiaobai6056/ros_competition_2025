@@ -1,0 +1,15 @@
+material StopMaterial
+{
+    technique
+    {
+        pass
+        {
+            lighting on
+            
+            texture_unit
+            {
+                texture grenn.png
+            }
+        }
+    }
+}
