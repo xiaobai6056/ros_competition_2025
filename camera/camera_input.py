@@ -10,7 +10,7 @@ class CameraInput:
         self.bridge = CvBridge()  # ROS图像↔OpenCV转换工具
         self.latest_frame = None  # 存储最新图像
         
-        rospy.Subscriber("/camera/image_raw", Image, self.image_callback)
+        rospy.Subscriber("/cam", Image, self.image_callback)
         self.image_pub = rospy.Publisher("/detect/raw_image", Image, queue_size=10)
         
         cv2.namedWindow("Camera Preview", cv2.WINDOW_NORMAL)
