@@ -1,0 +1,9 @@
+apple
+banana
+watermelon
+chili
+potato
+tomato
+milk
+cola
+cake
