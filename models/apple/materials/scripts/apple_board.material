@@ -1,0 +1,15 @@
+material apple
+{
+    technique
+    {
+        pass
+        {
+            texture_unit
+            {
+                texture apple.png
+                scale 1 1
+                rotate 90
+            }
+        }
+    }
+}
