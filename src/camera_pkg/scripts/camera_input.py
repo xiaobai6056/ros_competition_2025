@@ -16,7 +16,7 @@ class CameraInput:
         cv2.namedWindow("Camera Preview", cv2.WINDOW_NORMAL)
         cv2.resizeWindow("Camera Preview", 640, 480)
 
-        rospy.loginfo("摄像头转发节点启动：从/camera/image_raw转发到/detect/raw_image")
+        rospy.loginfo("摄像头转发节点启动：从/cam转发到/detect/raw_image")
 
     def image_callback(self, msg):
         

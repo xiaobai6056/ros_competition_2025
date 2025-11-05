@@ -1,0 +1,2 @@
+camera_pkg
+-DCATKIN_DEVEL_PREFIX=/home/xxy/ros_competition_2025/devel -DCMAKE_INSTALL_PREFIX=/home/xxy/ros_competition_2025/install -G Unix Makefiles

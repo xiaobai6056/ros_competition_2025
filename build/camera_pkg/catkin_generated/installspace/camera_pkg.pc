@@ -1,0 +1,8 @@
+prefix=/home/xxy/ros_competition_2025/install
+
+Name: camera_pkg
+Description: Description of camera_pkg
+Version: 0.0.0
+Cflags: 
+Libs: -L${prefix}/lib 
+Requires: 
