@@ -31,46 +31,52 @@ class ObjectDetector:
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
         
-        # 精确配置
+        # 精确配置 - 复用测试节点的相机参数
         self.config = {
-            'min_confidence': 0.30,
+            'min_confidence': 0.40,
             
-            # 相机参数
+            # 相机参数 - 复用测试节点的精确参数
             'camera_hfov': 1.3962634,    # 80度水平视野
-            'camera_vfov': 0.785,        # 45度垂直视野
-            'camera_position': (0.125, 0, 0.175),
             'image_width': 1920,
             'image_height': 1080,
+            'camera_position': (0.125, 0, 0.175),
             
-            # 参考尺寸
+            # 参考尺寸 - 使用单一高度参考
             'reference_object_height': 0.3,
-            'reference_object_width': 0.7,
-            'distance_weights': [0.9, 0.1, 0.0],
+            
+            # 移除复杂的距离权重，使用单一高度法
         }
         
-        # 预识别配置
+        # 初始化相机参数 - 复用测试节点的精确计算
+        self.initialize_camera_params()
+        
+        # 预识别配置 - 方案三：实时性优先策略
         self.pre_detection_config = {
-            'time_window': 3.0,
-            'min_score_threshold': 0.55,
-            'target_freshness': 2.0
+            'time_window': 1.0,           # 从3.0秒降至1.0秒，提高实时性
+            'min_score_threshold': 0.60,
+            'target_freshness': 0.5,      # 从2.0秒降至0.5秒，确保数据新鲜
+            'immediate_confidence': 0.75, # 单帧高置信度阈值
+            'max_detection_age': 0.3      # 检测最大年龄限制
         }
         
         # 边界框配置（基于你提供的四个点）
         self.boundary_points = [
-            (-0.3113971948623657, 2.8663101196289062),    # 左下
-            (3.790703773498535, 2.8181376457214355),      # 右下  
-            (3.7462081909179688, 7.67902946472168),       # 右上
-            (-0.33761417865753174, 7.638247489929199)     # 左上
+           (-0.81, 2.57),    # 左下
+           (4.21, 2.52),     # 右下
+           (4.16, 7.98),     # 右上
+           (-0.84, 7.94)     # 左上
         ]
         
         # 状态管理
         self.session_active = False
         self.current_task = ""
-        self.detection_history = deque(maxlen=30)
+        self.detection_history = deque(maxlen=20)  # 减少历史长度
         self.service_called = False
         self.direction_published = False
         self.current_best_target = None
         self.last_pre_detection_time = 0
+        self.last_frame_timestamp = None
+        self.frame_counter = 0  # 帧计数器
         
         # 订阅当前任务类型
         self.task_sub = rospy.Subscriber("/current_task", String, self.task_callback)
@@ -83,28 +89,44 @@ class ObjectDetector:
         
         # 类别映射
         self.class_map = {
-            0: ("水果", "苹果"),
-            1: ("水果", "香蕉"), 
-            2: ("水果", "西瓜"),
-            3: ("蔬菜", "辣椒"),
-            4: ("蔬菜", "土豆"),
-            5: ("蔬菜", "番茄"),
-            6: ("饮料", "牛奶"),
-            7: ("饮料", "可乐"),
-            8: ("食品", "蛋糕"),
+            0: ("水果", "香蕉"),        # banana
+            1: ("水果", "西瓜"),        # watermelon  
+            2: ("水果", "苹果"),        # apple
+            3: ("食品", "蛋糕"),        # cake
+            4: ("食品", "牛奶"),        # milk
+            5: ("食品", "可乐"),        # coke
+            6: ("蔬菜", "土豆"),        # potato
+            7: ("蔬菜", "番茄"),        # tomato
+            8: ("蔬菜", "辣椒"),        # chilli
         }
-        
         # 初始化模型
         self.model = self.load_model()
         
         # 订阅摄像头图像
         rospy.Subscriber("/detect/raw_image", Image, self.image_callback, queue_size=1)
         
-        rospy.loginfo("物体识别节点启动完成")
+        rospy.loginfo("物体识别节点启动完成 - 帧ID严格匹配模式")
         rospy.loginfo("边界区域: [{:.2f}, {:.2f}] -> [{:.2f}, {:.2f}]".format(
             self.boundary_points[0][0], self.boundary_points[0][1],
             self.boundary_points[2][0], self.boundary_points[2][1]
         ))
+        rospy.loginfo("相机参数: HFOV={:.2f}°, VFOV={:.2f}°".format(
+            math.degrees(self.config['camera_hfov']), math.degrees(self.config['camera_vfov'])))
+        rospy.loginfo("焦距: f_h={:.1f}, f_v={:.1f}".format(self.focal_length_h, self.focal_length_v))
+
+    def initialize_camera_params(self):
+        """初始化相机参数 - 复用测试节点的精确计算"""
+        # 计算垂直视场角
+        aspect_ratio = self.config['image_height'] / self.config['image_width']
+        hfov_rad = self.config['camera_hfov']
+        self.config['camera_vfov'] = 2 * math.atan(math.tan(hfov_rad/2) * aspect_ratio)
+        
+        # 计算焦距 - 复用测试节点的精确公式
+        self.focal_length_h = self.config['image_width'] / (2 * math.tan(self.config['camera_hfov'] / 2))
+        self.focal_length_v = self.config['image_height'] / (2 * math.tan(self.config['camera_vfov'] / 2))
+        
+        rospy.loginfo("相机参数初始化完成: VFOV={:.2f}°, f_h={:.1f}, f_v={:.1f}".format(
+            math.degrees(self.config['camera_vfov']), self.focal_length_h, self.focal_length_v))
 
     def load_model(self):
         """加载模型"""
@@ -142,94 +164,121 @@ class ObjectDetector:
         
         return in_boundary
 
-    def calculate_focal_lengths(self):
-        """计算焦距"""
-        focal_length_h = self.config['image_width'] / (2 * math.tan(self.config['camera_hfov'] / 2))
-        focal_length_v = self.config['image_height'] / (2 * math.tan(self.config['camera_vfov'] / 2))
-        return focal_length_h, focal_length_v
-
-    def estimate_distance(self, detection, frame_shape):
-        """距离估算"""
-        try:
-            x1, y1, x2, y2 = detection[0], detection[1], detection[2], detection[3]
-            
-            focal_length_h, focal_length_v = self.calculate_focal_lengths()
-            
-            bbox_height = y2 - y1
-            bbox_width = x2 - x1
-            
-            # 高度法
-            if bbox_height > 0:
-                distance_height = (focal_length_v * self.config['reference_object_height']) / bbox_height
-            else:
-                distance_height = 2.0
-            
-            # 宽度法
-            if bbox_width > 0:
-                distance_width = (focal_length_h * self.config['reference_object_width']) / bbox_width
-            else:
-                distance_width = 2.0
-            
-            # 加权平均
-            weights = self.config['distance_weights']
-            distances = [distance_height, distance_width, 10.0]
-            weighted_avg = sum(d * w for d, w in zip(distances, weights))
-            
-            return max(0.5, min(8.0, weighted_avg))
-            
-        except Exception as e:
-            rospy.logwarn("距离估算失败: {}".format(e))
+    def calculate_visual_distance(self, bbox_height):
+        """视觉距离估算 - 复用测试节点的精确方法"""
+        if bbox_height <= 10:
+            rospy.logwarn("检测框高度过小({:.1f}px)，使用默认距离2.0m".format(bbox_height))
             return 2.0
+        
+        # 复用测试节点的精确公式：距离 = (垂直焦距 × 参考物体高度) / 检测框高度
+        distance = (self.focal_length_v * self.config['reference_object_height']) / bbox_height
+        
+        # 限制距离范围
+        distance = max(0.5, min(8.0, distance))
+        
+        rospy.logdebug("距离估算: 框高={:.1f}px, 焦距_v={:.1f}, 参考高={:.2f}m -> 距离={:.2f}m".format(
+            bbox_height, self.focal_length_v, self.config['reference_object_height'], distance))
+        
+        return distance
 
-    def calculate_horizontal_angle(self, detection, frame_shape):
-        """角度计算"""
+    def calculate_visual_angle(self, bbox_center_x):
+        """视觉角度估算 - 复用测试节点的精确方法"""
+        # 复用测试节点的精确公式：角度 = 像素偏移量 / 水平焦距
+        pixel_offset = bbox_center_x - self.config['image_width'] / 2
+        angle = pixel_offset / self.focal_length_h
+        
+        # 限制角度范围
+        max_angle = self.config['camera_hfov'] / 2
+        angle = max(-max_angle, min(max_angle, angle))
+        
+        rospy.logdebug("角度估算: 中心_x={:.1f}px, 像素偏移={:.1f}, 焦距_h={:.1f} -> 角度={:.3f}rad".format(
+            bbox_center_x, pixel_offset, self.focal_length_h, angle))
+        
+        return angle
+
+    def visual_to_robot_coords(self, distance, angle):
+        """视觉坐标转换到机器人坐标系 - 复用测试节点的精确方法"""
+        camera_x, camera_y, _ = self.config['camera_position']
+        target_x = camera_x + distance * math.cos(angle)
+        target_y = camera_y + distance * math.sin(angle)
+        
+        rospy.logdebug("机器人坐标: 相机位置=({:.3f}, {:.3f}), 距离={:.2f}m, 角度={:.3f}rad -> 目标=({:.2f}, {:.2f})".format(
+            camera_x, camera_y, distance, angle, target_x, target_y))
+        
+        return target_x, target_y
+
+    def transform_to_world_coordinates(self, detection, frame_shape, obj_name, stamp=None, frame_id=None):
+        """世界坐标转换 - 使用测试节点的精确计算逻辑"""
         try:
+            # 提取检测框信息
             x1, y1, x2, y2 = detection[0], detection[1], detection[2], detection[3]
-            img_width = frame_shape[1]
-            
+            bbox_height = y2 - y1
             bbox_center_x = (x1 + x2) / 2
-            img_center_x = img_width / 2
             
-            pixel_offset = bbox_center_x - img_center_x
-            pixels_per_radian = img_width / self.config['camera_hfov']
-            horizontal_angle = pixel_offset / pixels_per_radian
+            rospy.loginfo("🔍 坐标计算开始[帧{}]: {} 框高={:.1f}px, 中心_x={:.1f}px".format(
+                frame_id, obj_name, bbox_height, bbox_center_x))
             
-            max_angle = self.config['camera_hfov'] / 2
-            return max(-max_angle, min(max_angle, horizontal_angle))
+            # 1. 使用测试节点的距离估算方法
+            distance = self.calculate_visual_distance(bbox_height)
             
-        except Exception as e:
-            rospy.logwarn("角度计算失败: {}".format(e))
-            return 0.0
-
-    def transform_to_world_coordinates(self, detection, frame_shape, obj_name):
-        """世界坐标转换"""
-        try:
-            robot_x, robot_y, robot_yaw = self.get_robot_pose()
-            distance = self.estimate_distance(detection, frame_shape)
-            horizontal_angle = self.calculate_horizontal_angle(detection, frame_shape)
+            # 2. 使用测试节点的角度估算方法  
+            horizontal_angle = self.calculate_visual_angle(bbox_center_x)
             
-            camera_x, camera_y, _ = self.config['camera_position']
-            target_x_robot = camera_x + distance * math.cos(horizontal_angle)
-            target_y_robot = camera_y + distance * math.sin(horizontal_angle)
+            # 3. 转换到机器人坐标系
+            target_x_robot, target_y_robot = self.visual_to_robot_coords(distance, horizontal_angle)
             
-            cos_yaw = math.cos(robot_yaw)
-            sin_yaw = math.sin(robot_yaw)
-            target_x_world = robot_x + target_x_robot * cos_yaw - target_y_robot * sin_yaw
-            target_y_world = robot_y + target_x_robot * sin_yaw + target_y_robot * cos_yaw
+            # 4. 转换到世界坐标系
+            target_x_world, target_y_world = self.robot_to_world_coords(target_x_robot, target_y_robot, stamp)
             
-            rospy.loginfo("坐标计算: {} -> ({:.2f}, {:.2f})m".format(obj_name, target_x_world, target_y_world))
+            rospy.loginfo("🎯 坐标计算结果[帧{}]: {} -> 机器人坐标=({:.2f}, {:.2f}), 世界坐标=({:.2f}, {:.2f})m".format(
+                frame_id, obj_name, target_x_robot, target_y_robot, target_x_world, target_y_world))
             
             return target_x_world, target_y_world
             
         except Exception as e:
             rospy.logwarn("坐标转换失败: {}".format(e))
-            robot_x, robot_y, robot_yaw = self.get_robot_pose()
-            return robot_x + 2.0 * math.cos(robot_yaw), robot_y + 2.0 * math.sin(robot_yaw)
+            # 出错时返回机器人前方2米的位置
+            robot_x, robot_y, robot_yaw = self.get_robot_pose(stamp)
+            fallback_x = robot_x + 2.0 * math.cos(robot_yaw)
+            fallback_y = robot_y + 2.0 * math.sin(robot_yaw)
+            rospy.logwarn("使用备用坐标: ({:.2f}, {:.2f})".format(fallback_x, fallback_y))
+            return fallback_x, fallback_y
 
-    def get_robot_pose(self):
+    def robot_to_world_coords(self, robot_x, robot_y, stamp=None):
+        """机器人坐标系转世界坐标系"""
+        try:
+            if stamp is None:
+                stamp = rospy.Time.now()
+                
+            transform = self.tf_buffer.lookup_transform("map", "base_link", stamp, rospy.Duration(0.1))
+            world_x = transform.transform.translation.x
+            world_y = transform.transform.translation.y
+            
+            q = transform.transform.rotation
+            robot_yaw = math.atan2(2.0*(q.w*q.z + q.x*q.y), 1.0-2.0*(q.y*q.y + q.z*q.z))
+            
+            # 坐标转换 - 复用测试节点的精确方法
+            cos_yaw = math.cos(robot_yaw)
+            sin_yaw = math.sin(robot_yaw)
+            target_x = world_x + robot_x * cos_yaw - robot_y * sin_yaw
+            target_y = world_y + robot_x * sin_yaw + robot_y * cos_yaw
+            
+            rospy.logdebug("世界坐标转换: 机器人位置=({:.2f}, {:.2f}), 偏航角={:.3f}rad -> 世界坐标=({:.2f}, {:.2f})".format(
+                world_x, world_y, robot_yaw, target_x, target_y))
+            
+            return target_x, target_y
+            
+        except Exception as e:
+            rospy.logwarn("坐标转换失败: {}".format(e))
+            return 0.0, 0.0
+
+    def get_robot_pose(self, stamp=None):
         """获取机器人位姿"""
         try:
-            transform = self.tf_buffer.lookup_transform("map", "base_link", rospy.Time(0), rospy.Duration(0.1))
+            if stamp is None:
+                stamp = rospy.Time.now()
+                
+            transform = self.tf_buffer.lookup_transform("map", "base_link", stamp, rospy.Duration(0.1))
             x = transform.transform.translation.x
             y = transform.transform.translation.y
             
@@ -255,12 +304,19 @@ class ObjectDetector:
         """图像回调"""
         try:
             cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
-            self.detection_pipeline(cv_image)
+            self.last_frame_timestamp = msg.header.stamp
+            self.frame_counter += 1  # 增加帧计数器
+            current_frame_id = self.frame_counter
+            
+            rospy.loginfo("📷 收到图像帧: ID={}, 时间戳={}.{}".format(
+                current_frame_id, msg.header.stamp.secs, msg.header.stamp.nsecs))
+            
+            self.detection_pipeline(cv_image, msg.header.stamp, current_frame_id)
             
         except Exception as e:
             rospy.logwarn("图像回调异常: {}".format(e))
 
-    def detection_pipeline(self, frame):
+    def detection_pipeline(self, frame, stamp, frame_id):
         """检测流水线"""
         if self.model is None:
             rospy.logwarn("模型未加载，跳过检测")
@@ -272,9 +328,9 @@ class ObjectDetector:
                 detections = results.pandas().xyxy[0].values
                 
                 if len(detections) > 0:
-                    self.process_detections(detections, frame)
+                    self.process_detections(detections, frame, stamp, frame_id)
                     if not self.service_called:
-                        self.smart_pre_detection_publish(frame)
+                        self.smart_pre_detection_publish(frame, stamp, frame_id)
                 else:
                     if not self.session_active and len(self.detection_history) % 30 == 0:
                         self.publish_target_position(0.0, 0.0, 0.0)
@@ -282,12 +338,13 @@ class ObjectDetector:
         except Exception as e:
             rospy.logwarn("检测流水线异常: {}".format(e))
 
-    def process_detections(self, detections, frame):
-        """处理检测结果"""
+    def process_detections(self, detections, frame, stamp, frame_id):
+        """处理检测结果 - 使用帧ID严格匹配"""
         current_time = time.time()
-        rospy.loginfo("处理 {} 个检测".format(len(detections)))
+        rospy.loginfo("处理[帧{}] {} 个检测".format(frame_id, len(detections)))
         
         valid_detection_count = 0
+        frame_detections = []  # 当前帧的所有检测
         
         for i, detection in enumerate(detections):
             confidence = detection[4]
@@ -299,88 +356,145 @@ class ObjectDetector:
             category, obj_name = self.class_map[cls_id]
             
             if confidence >= self.config['min_confidence']:
+                # 使用帧ID严格匹配：立即计算并存储坐标
+                target_x, target_y = self.transform_to_world_coordinates(
+                    detection, frame.shape, obj_name, stamp, frame_id)
+                
                 detection_record = {
                     'object': obj_name,
                     'category': category,
                     'confidence': confidence,
                     'detection': detection,
                     'timestamp': current_time,
+                    'calculated_coords': (target_x, target_y),  # 存储计算好的坐标
+                    'frame_timestamp': stamp,  # 存储图像时间戳
+                    'frame_id': frame_id  # 关键：存储帧ID
                 }
                 
                 self.detection_history.append(detection_record)
+                frame_detections.append(detection_record)
                 valid_detection_count += 1
-                rospy.loginfo("✅ 有效检测: {} 置信度: {:.3f}".format(obj_name, confidence))
+                
+                # 单帧高置信度立即发布 - 使用当前帧的检测
+                if (confidence >= self.pre_detection_config['immediate_confidence'] and 
+                    not self.service_called and 
+                    not self.direction_published):
+                    
+                    # 检查任务匹配
+                    if self.current_task and category != self.current_task:
+                        rospy.logwarn("🚫 [帧{}]任务不匹配，取消单帧发布: 需要 {}, 检测到 {}".format(
+                            frame_id, self.current_task, category))
+                        continue
+                    
+                    # 检查坐标边界
+                    if not self.is_point_in_boundary(target_x, target_y):
+                        rospy.logwarn("❌ [帧{}]坐标超出边界，取消单帧发布: {} -> ({:.2f}, {:.2f})".format(
+                            frame_id, obj_name, target_x, target_y))
+                        continue
+                    
+                    rospy.loginfo("🚀 [帧{}]单帧高置信度立即发布: {} (置信度: {:.3f}, 任务匹配)".format(
+                        frame_id, obj_name, confidence))
+                    self.publish_target_position(target_x, target_y, 0.0)
+                    self.direction_published = True
+                    self.last_pre_detection_time = current_time
+                    
+                rospy.loginfo("✅ [帧{}]有效检测: {} 置信度: {:.3f} 坐标: ({:.2f}, {:.2f})".format(
+                    frame_id, obj_name, confidence, target_x, target_y))
         
-        rospy.loginfo("本次处理完成: {} 个有效检测，检测历史长度: {}".format(
-            valid_detection_count, len(self.detection_history)))
+        rospy.loginfo("[帧{}]处理完成: {} 个有效检测，检测历史长度: {}".format(
+            frame_id, valid_detection_count, len(self.detection_history)))
         
-        # 更新最佳预识别目标
-        if not self.service_called:
-            self.update_best_pre_detection_target()
+        # 更新最佳预识别目标 - 使用当前帧的数据
+        if not self.service_called and frame_detections:
+            self.update_best_pre_detection_target(frame_detections, frame_id)
 
-    def update_best_pre_detection_target(self):
-        """更新最佳预识别目标"""
-        if not self.detection_history:
+    def update_best_pre_detection_target(self, current_frame_detections, frame_id):
+        """更新最佳预识别目标 - 基于当前帧数据"""
+        if not current_frame_detections:
             return
             
         if self.service_called:
             return
         
         current_time = time.time()
-        recent_detections = [d for d in self.detection_history 
-                           if current_time - d['timestamp'] < self.pre_detection_config['time_window']]
         
-        if not recent_detections:
-            return
+        # 只使用当前帧的检测数据进行统计
+        detection_source = current_frame_detections
+        
+        rospy.loginfo("[帧{}]使用当前帧 {} 个检测进行统计".format(frame_id, len(detection_source)))
         
         # 筛选任务相关检测
         task_related_detections = []
         if self.current_task:
-            task_related_detections = [d for d in recent_detections 
-                                     if d['category'] == self.current_task]
+            task_related_detections = [d for d in detection_source 
+                                    if d['category'] == self.current_task]
             if not task_related_detections:
+                rospy.loginfo("⚠️ [帧{}]无任务相关检测: 需要 {}".format(frame_id, self.current_task))
+                self.current_best_target = None
                 return
+            else:
+                rospy.loginfo("✅ [帧{}]找到 {} 个任务相关检测: {}".format(
+                    frame_id, len(task_related_detections), self.current_task))
         else:
-            task_related_detections = recent_detections
+            task_related_detections = detection_source
+            rospy.loginfo("📋 [帧{}]无任务限制，使用所有检测数据".format(frame_id))
         
-        # 统计物体出现情况
+        if not task_related_detections:
+            self.current_best_target = None
+            return
+        
+        # 统计物体出现情况（在当前帧内）
         object_stats = {}
         for det in task_related_detections:
             obj_name = det['object']
             if obj_name not in object_stats:
-                object_stats[obj_name] = {'count': 0, 'total_confidence': 0, 'last_detection': det}
+                object_stats[obj_name] = {'count': 0, 'total_confidence': 0, 'detections': []}
             object_stats[obj_name]['count'] += 1
             object_stats[obj_name]['total_confidence'] += det['confidence']
+            object_stats[obj_name]['detections'].append(det)
         
-        # 计算评分
+        # 计算评分 - 基于当前帧数据
         best_object = None
         best_score = -1
+        best_detection = None
         
         for obj_name, stats in object_stats.items():
             avg_confidence = stats['total_confidence'] / stats['count']
-            frequency_score = min(stats['count'] / 3.0, 1.0) * 0.3
-            confidence_score = avg_confidence * 0.7
+            
+            # 使用当前帧内的频率和置信度
+            frequency_score = min(stats['count'] / 3.0, 1.0) * 0.2
+            confidence_score = avg_confidence * 0.8
             total_score = frequency_score + confidence_score
+            
+            rospy.loginfo("📈 [帧{}]物体评分: {} -> 频率={:.3f}(计数{}), 置信度={:.3f}, 总分={:.3f}".format(
+                frame_id, obj_name, frequency_score, stats['count'], confidence_score, total_score))
             
             if total_score > best_score:
                 best_score = total_score
                 best_object = obj_name
-                best_stats = stats
+                # 选择置信度最高的检测作为代表
+                best_detection = max(stats['detections'], key=lambda x: x['confidence'])
         
         # 更新最佳目标
         if best_object and best_score > self.pre_detection_config['min_score_threshold']:
             self.current_best_target = {
                 'object': best_object,
-                'detection': best_stats['last_detection']['detection'],
+                'detection': best_detection['detection'],
+                'calculated_coords': best_detection['calculated_coords'],  # 使用存储坐标
                 'score': best_score,
                 'update_time': current_time,
+                'frame_id': frame_id  # 关键：存储帧ID
             }
-            rospy.loginfo("🎯 更新最佳目标: {} (得分: {:.3f})".format(best_object, best_score))
+            rospy.loginfo("🎯 [帧{}]更新最佳目标: {} (得分: {:.3f}, 帧ID: {})".format(
+                frame_id, best_object, best_score, frame_id))
         else:
             self.current_best_target = None
+            if best_object:
+                rospy.loginfo("📉 [帧{}]目标评分不足: {} (得分: {:.3f}, 阈值: {:.3f})".format(
+                    frame_id, best_object, best_score, self.pre_detection_config['min_score_threshold']))
 
-    def smart_pre_detection_publish(self, frame):
-        """智能预识别发布"""
+    def smart_pre_detection_publish(self, frame, stamp, frame_id):
+        """智能预识别发布 - 严格使用帧ID匹配的坐标"""
         if self.current_best_target is None:
             return
             
@@ -394,29 +508,43 @@ class ObjectDetector:
         if current_time - self.last_pre_detection_time < 0.5:
             return
         
-        if current_time - self.current_best_target['update_time'] > self.pre_detection_config['target_freshness']:
+        # 检查帧ID匹配
+        if self.current_best_target.get('frame_id') != frame_id:
+            rospy.logwarn("⚠️ 帧ID不匹配: 最佳目标帧ID={}, 当前帧ID={}".format(
+                self.current_best_target.get('frame_id'), frame_id))
             return
         
-        detection = self.current_best_target['detection']
+        # 严格的新鲜度检查
+        if current_time - self.current_best_target['update_time'] > self.pre_detection_config['target_freshness']:
+            rospy.logwarn("⚠️ 最佳目标已过期: {} (年龄: {:.2f}s)".format(
+                self.current_best_target['object'], 
+                current_time - self.current_best_target['update_time']))
+            return
+        
         obj_name = self.current_best_target['object']
         score = self.current_best_target['score']
+        target_frame_id = self.current_best_target['frame_id']
         
-        rospy.loginfo("🎯 准备发布预识别: {} (得分: {:.3f})".format(obj_name, score))
+        # 严格使用存储的坐标
+        target_x, target_y = self.current_best_target['calculated_coords']
         
-        target_x, target_y = self.transform_to_world_coordinates(detection, frame.shape, obj_name)
+        rospy.loginfo("🎯 [帧{}]准备发布预识别: {} (得分: {:.3f}, 坐标: ({:.2f}, {:.2f}))".format(
+            target_frame_id, obj_name, score, target_x, target_y))
         
         # 检查坐标是否在边界内
         if not self.is_point_in_boundary(target_x, target_y):
-            rospy.logwarn("❌ 坐标超出边界，取消发布: {} -> ({:.2f}, {:.2f})".format(obj_name, target_x, target_y))
+            rospy.logwarn("❌ [帧{}]坐标超出边界，取消发布: {} -> ({:.2f}, {:.2f})".format(
+                target_frame_id, obj_name, target_x, target_y))
             return
         
-        rospy.loginfo("📍 发布坐标: {} -> ({:.2f}, {:.2f})".format(obj_name, target_x, target_y))
+        rospy.loginfo("📍 [帧{}]发布坐标: {} -> ({:.2f}, {:.2f})".format(
+            target_frame_id, obj_name, target_x, target_y))
         self.publish_target_position(target_x, target_y, 0.0)
         
         self.direction_published = True
         self.last_pre_detection_time = current_time
         
-        rospy.loginfo("✅ 预识别发布完成")
+        rospy.loginfo("✅ [帧{}]预识别发布完成 - 帧ID严格匹配".format(target_frame_id))
 
     def publish_target_position(self, x, y, z):
         """发布目标位置"""
@@ -455,17 +583,18 @@ class ObjectDetector:
         try:
             current_time = time.time()
             
-            # 查找最近检测结果
+            # 查找最近检测结果 - 使用更短的时间窗口
             recent_detections = []
             for det in reversed(self.detection_history):
                 time_diff = current_time - det['timestamp']
-                if time_diff < 5.0:
+                if time_diff < 3.0:  # 从5秒降至3秒
                     recent_detections.append(det)
-                    rospy.loginfo("有效检测: {} ({}秒前)".format(det['object'], time_diff))
-                if len(recent_detections) >= 15:
+                    rospy.loginfo("有效检测: {} ({}秒前, 帧ID:{})".format(
+                        det['object'], time_diff, det.get('frame_id', 'N/A')))
+                if len(recent_detections) >= 10:  # 减少最大数量
                     break
             
-            rospy.loginfo("最近5秒内的检测数量: {}".format(len(recent_detections)))
+            rospy.loginfo("最近3秒内的检测数量: {}".format(len(recent_detections)))
             
             if not recent_detections:
                 rospy.logwarn("没有最近的检测")
@@ -501,7 +630,7 @@ class ObjectDetector:
                 rospy.logwarn("任务不匹配: 需要 {}, 检测到 {}".format(self.current_task, category))
                 response.message = "WARN:" + obj_name
             else:
-                required_count = min(3, len(recent_detections) // 2 + 1)
+                required_count = min(2, len(recent_detections) // 2 + 1)  # 降低要求
                 rospy.loginfo("要求次数: {} (当前: {})".format(required_count, count))
                 
                 if count >= required_count:
@@ -556,6 +685,7 @@ class ObjectDetector:
         self.service_called = False
         self.direction_published = False
         self.current_best_target = None
+        self.frame_counter = 0  # 重置帧计数器
         
         self.publish_target_position(0.0, 0.0, 0.0)
         
