@@ -47,6 +47,7 @@ NavigationStateMachine::NavigationStateMachine(ros::NodeHandle& nh)
     // 初始化服务客户端
     qr_service_client_ = nh_.serviceClient<std_srvs::Trigger>("/qr_recognition");
     object_service_client_ = nh_.serviceClient<std_srvs::Trigger>("/object_recognition");
+    reset_pre_detection_client_ = nh_.serviceClient<std_srvs::Trigger>("/reset_pre_detection"); // 添加这一行
     
     // 加载导航点
     loadNavigationPoints();
@@ -187,7 +188,7 @@ void NavigationStateMachine::handleScanningBoards() {
             rotated_angle = 2 * M_PI - rotated_angle;
         }
         
-        ROS_INFO_THROTTLE(1, "旋转优化: %.1f°/60°", rotated_angle * 180 / M_PI);
+        ROS_INFO_THROTTLE(1, "旋转优化: %.1f°/180°", rotated_angle * 180 / M_PI);
         
         // 检查停止条件
         bool should_stop = false;
@@ -753,75 +754,85 @@ void NavigationStateMachine::detectObjectClusters(const sensor_msgs::LaserScan::
         }
     }
     
-    // ========== 精简优先级排序 ==========
-    if (!detected_clusters_.empty()) {
-        std::vector<std::pair<size_t, float>> point_scores;
+   // ========== 精简优先级排序 ==========
+if (!detected_clusters_.empty()) {
+    std::vector<std::pair<size_t, float>> point_scores;
+    
+    for (size_t i = 0; i < detected_clusters_.size(); ++i) {
+        float score = 0.0f;
         
-        for (size_t i = 0; i < detected_clusters_.size(); ++i) {
-            float score = 0.0f;
+        if (has_pre_detection_) {
+            float dx = detected_clusters_[i].x - pre_detected_target_.x;
+            float dy = detected_clusters_[i].y - pre_detected_target_.y;
+            float distance_to_target = sqrt(dx*dx + dy*dy);
             
-            if (has_pre_detection_) {
-                float dx = detected_clusters_[i].x - pre_detected_target_.x;
-                float dy = detected_clusters_[i].y - pre_detected_target_.y;
-                float distance_to_target = sqrt(dx*dx + dy*dy);
-                
-                float distance_score = 1.0f - std::min(distance_to_target / 5.0f, 1.0f);
-                score = distance_score * 0.7f;
-                
-                // 只在详细输出时显示预识别距离
-                if (should_output_details) {
-                    ROS_INFO("安全点[%zu]预识别距离: %.2fm, 距离得分: %.2f", 
-                             i, distance_to_target, distance_score);
-                }
-            }
+            float distance_score = 1.0f - std::min(distance_to_target / 5.0f, 1.0f);
+            score = distance_score * 0.7f;
             
-            float dx_to_robot = detected_clusters_[i].x - scan_robot_x_;
-            float dy_to_robot = detected_clusters_[i].y - scan_robot_y_;
-            float to_point_yaw = atan2(dy_to_robot, dx_to_robot);
-            float angle_diff = fabs(to_point_yaw - scan_robot_yaw_);
-            if (angle_diff > M_PI) angle_diff = 2 * M_PI - angle_diff;
-            
-            float direction_score = 1.0f - (angle_diff / M_PI);
-            score += direction_score * 0.3f;
-            
-            point_scores.push_back({i, score});
-            
-            // 只在详细输出时显示综合评分
+            // 只在详细输出时显示预识别距离
             if (should_output_details) {
-                ROS_INFO("安全点[%zu]综合评分: 总得分=%.2f", i, score);
+                ROS_INFO("安全点[%zu]预识别距离: %.2fm, 距离得分: %.2f", 
+                         i, distance_to_target, distance_score);
             }
         }
         
-        std::sort(point_scores.begin(), point_scores.end(), 
-                  [](const auto& a, const auto& b) { return a.second > b.second; });
+        float dx_to_robot = detected_clusters_[i].x - scan_robot_x_;
+        float dy_to_robot = detected_clusters_[i].y - scan_robot_y_;
+        float to_point_yaw = atan2(dy_to_robot, dx_to_robot);
+        float angle_diff = fabs(to_point_yaw - scan_robot_yaw_);
+        if (angle_diff > M_PI) angle_diff = 2 * M_PI - angle_diff;
         
-        std::vector<geometry_msgs::Point> sorted_clusters;
-        std::vector<ClusterInfo> sorted_infos;
+        float direction_score = 1.0f - (angle_diff / M_PI);
+        score += direction_score * 0.3f;
         
-        for (const auto& item : point_scores) {
-            sorted_clusters.push_back(detected_clusters_[item.first]);
-            sorted_infos.push_back(detected_cluster_infos_[item.first]);
-        }
+        point_scores.push_back({i, score});
         
-        detected_clusters_ = sorted_clusters;
-        detected_cluster_infos_ = sorted_infos;
-        
+        // 只在详细输出时显示综合评分
         if (should_output_details) {
-            if (has_pre_detection_) {
-                ROS_INFO("安全点排序完成，优先检查距离预识别目标最近的识别板");
-            } else {
-                ROS_INFO("安全点排序完成，优先检查正前方的识别板");
-            }
+            ROS_INFO("安全点[%zu]综合评分: 总得分=%.2f", i, score);
         }
     }
     
-    clusters_detected_ = !detected_clusters_.empty();
+    std::sort(point_scores.begin(), point_scores.end(), 
+              [](const auto& a, const auto& b) { return a.second > b.second; });
     
-    // 总是输出检测结果，但简化输出内容
+    // === 在排序后添加详细日志 ===
+    ROS_INFO("=== 排序结果 ===");
+    for (size_t i = 0; i < point_scores.size(); ++i) {
+        size_t original_index = point_scores[i].first;
+        float score = point_scores[i].second;
+        
+        ROS_INFO("排序[%zu]: 原索引=%zu, 位置(%.2f, %.2f), 得分=%.3f", 
+                i, original_index, 
+                detected_clusters_[original_index].x, 
+                detected_clusters_[original_index].y, 
+                score);
+    }
+
+    std::vector<geometry_msgs::Point> sorted_clusters;
+    std::vector<ClusterInfo> sorted_infos;
+
+    for (const auto& item : point_scores) {
+        sorted_clusters.push_back(detected_clusters_[item.first]);
+        sorted_infos.push_back(detected_cluster_infos_[item.first]);
+        
+        ROS_INFO("最终顺序[%zu]: 位置(%.2f, %.2f)", 
+                sorted_clusters.size() - 1,
+                sorted_clusters.back().x, 
+                sorted_clusters.back().y);
+    }
+
+    detected_clusters_ = sorted_clusters;
+    detected_cluster_infos_ = sorted_infos;
+    // === 详细日志结束 ===
+    
     if (should_output_details) {
-        ROS_INFO("检测完成: 发现 %zu 个识别板", detected_clusters_.size());
-    } else {
-        ROS_DEBUG_THROTTLE(1, "检测到 %zu 个识别板", detected_clusters_.size());
+        if (has_pre_detection_) {
+            ROS_INFO("安全点排序完成，优先检查距离预识别目标最近的识别板");
+        } else {
+            ROS_INFO("安全点排序完成，优先检查正前方的识别板");
+        }
+    }
     }
 }
 
@@ -1487,7 +1498,15 @@ float NavigationStateMachine::calculateAdaptiveSafeDistance(const geometry_msgs:
    void NavigationStateMachine::resetPreDetectionData() {
         try {
             std_srvs::Trigger reset_srv;
+            ROS_INFO("=== 重置预检测数据开始 ===");
+        
+            // 首先清除本地存储的预识别坐标
+            pre_detected_target_.x = 0.0;
+            pre_detected_target_.y = 0.0;
+            pre_detected_target_.z = 0.0;
+            has_pre_detection_ = false;
             
+            ROS_INFO("已清除本地预识别坐标");
             // 等待服务可用（短暂等待）
             if (reset_pre_detection_client_.waitForExistence(ros::Duration(1.0))) {
                 if (reset_pre_detection_client_.call(reset_srv)) {
