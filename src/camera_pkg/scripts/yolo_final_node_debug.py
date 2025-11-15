@@ -337,9 +337,62 @@ class ObjectDetector:
                     
         except Exception as e:
             rospy.logwarn("检测流水线异常: {}".format(e))
+    
+    def is_valid_detection(self, detection, obj_name):
+        """检查检测框尺寸合理性 - 基于实际数据分析"""
+        x1, y1, x2, y2 = detection[0], detection[1], detection[2], detection[3]
+        bbox_height = y2 - y1
+        bbox_width = x2 - x1
+        
+        rospy.logdebug("📏 检测框尺寸检查: {} -> {}x{}px".format(obj_name, bbox_width, bbox_height))
+        
+        # 基于实际数据的精确阈值
+        min_size = 80   # 最小尺寸限制
+        max_size = 450  # 最大尺寸限制
+        
+        # 1. 最小尺寸限制
+        if bbox_height < min_size or bbox_width < min_size:
+            rospy.logwarn("🚫 检测框过小被过滤: {} {}x{}px < {}px".format(
+                obj_name, bbox_width, bbox_height, min_size))
+            return False
+        
+        # 2. 最大尺寸限制  
+        if bbox_height > max_size or bbox_width > max_size:
+            rospy.logwarn("🚫 检测框过大被过滤: {} {}x{}px > {}px".format(
+                obj_name, bbox_width, bbox_height, max_size))
+            return False
+        
+        # 3. 特殊处理：西瓜需要更大尺寸才可信（基于误识别分析）
+        if obj_name == '西瓜' and bbox_height < 100:
+            rospy.logwarn("🚫 西瓜检测框过小被过滤: {}x{}px < 100px".format(bbox_width, bbox_height))
+            return False
+            
+        # 4. 宽高比检查（可选，进一步过滤异常检测）
+        aspect_ratio = bbox_width / bbox_height
+        if aspect_ratio < 0.3 or aspect_ratio > 3.0:
+            rospy.logwarn("🚫 检测框宽高比异常: {} {:.2f}".format(obj_name, aspect_ratio))
+            return False
+        
+        rospy.loginfo("✅ 检测框尺寸合法: {} {}x{}px".format(obj_name, bbox_width, bbox_height))
+        return True
+
+    def get_class_specific_threshold(self, obj_name):
+        """为易误识别类别设置更高阈值"""
+        high_threshold_classes = {
+            '西瓜': 0.65,   
+            '蛋糕': 0.45,   
+            '香蕉': 0.45,   
+            '苹果': 0.45,
+            '牛奶': 0.45,
+            '可乐': 0.45,
+            '土豆': 0.45,
+            '番茄': 0.45,
+            '辣椒': 0.45
+        }
+        return high_threshold_classes.get(obj_name, self.config['min_confidence'])
 
     def process_detections(self, detections, frame, stamp, frame_id):
-        """处理检测结果 - 使用帧ID严格匹配"""
+        """处理检测结果 - 使用帧ID严格匹配 + 检测合法性检查"""
         current_time = time.time()
         rospy.loginfo("处理[帧{}] {} 个检测".format(frame_id, len(detections)))
         
@@ -355,8 +408,17 @@ class ObjectDetector:
                 
             category, obj_name = self.class_map[cls_id]
             
-            if confidence >= self.config['min_confidence']:
-                # 使用帧ID严格匹配：立即计算并存储坐标
+            # 使用类别特异性阈值
+            confidence_threshold = self.get_class_specific_threshold(obj_name)
+            
+            if confidence >= confidence_threshold:
+                # 1. 检测框尺寸合法性检查
+                if not self.is_valid_detection(detection, obj_name):
+                    rospy.logwarn("🚫 [帧{}]检测框不合法被过滤: {} (置信度: {:.3f})".format(
+                        frame_id, obj_name, confidence))
+                    continue
+                    
+                # 方案三：立即计算并存储坐标，确保名称与坐标匹配
                 target_x, target_y = self.transform_to_world_coordinates(
                     detection, frame.shape, obj_name, stamp, frame_id)
                 
