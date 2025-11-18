@@ -7,6 +7,14 @@
 #include <std_srvs/Trigger.h>
 #include <std_msgs/String.h>
 
+// 常量定义（与头文件保持一致）
+constexpr float NavigationStateMachine::TARGET_OBSTACLE_DISTANCE;
+constexpr float NavigationStateMachine::DEFAULT_SAFE_DISTANCE;
+constexpr float NavigationStateMachine::EXTENDED_SAFE_DISTANCE;
+constexpr int NavigationStateMachine::LASER_SCAN_TIMEOUT;
+constexpr int NavigationStateMachine::VISUAL_RECOGNITION_TIMEOUT;
+constexpr int NavigationStateMachine::SERVICE_RETRY_COUNT;
+
 NavigationStateMachine::NavigationStateMachine(ros::NodeHandle& nh) 
     : nh_(nh), 
       current_state_(RobotState::INIT),
@@ -19,7 +27,18 @@ NavigationStateMachine::NavigationStateMachine(ros::NodeHandle& nh)
       scan_start_time_(ros::Time::now()),
       scan_robot_x_(0.0f),
       scan_robot_y_(0.0f),
-      scan_robot_yaw_(0.0f)
+      scan_robot_yaw_(0.0f),
+      rotation_optimization_active_(false),
+      rotation_start_yaw_(0.0f),
+      clusters_calculated_(false),
+      object_detected_during_scan_(false),
+      detected_object_name_(""),
+      costmap_updated_(false),
+      current_target_cluster_(-1),
+      clusters_detected_(false),
+      moving_to_cluster_(false),
+      qr_service_called_(false),
+      object_service_called_(false)
 {
     // 等待action server
     ROS_INFO("等待move_base action server...");
@@ -38,6 +57,7 @@ NavigationStateMachine::NavigationStateMachine(ros::NodeHandle& nh)
     simulation_sub_ = nh_.subscribe("/demo/simulation_result", 1, &NavigationStateMachine::simulationCallback, this);
     traffic_sub_ = nh_.subscribe("/demo/traffic_result", 1, &NavigationStateMachine::trafficCallback, this);
     laser_sub_ = nh_.subscribe("/scan", 1, &NavigationStateMachine::laserCallback, this);
+    object_detected_sub_ = nh_.subscribe("/object_detected", 1, &NavigationStateMachine::objectDetectedCallback, this);
     
     // 初始化服务客户端
     qr_service_client_ = nh_.serviceClient<std_srvs::Trigger>("/qr_recognition");
@@ -50,8 +70,7 @@ NavigationStateMachine::NavigationStateMachine(ros::NodeHandle& nh)
                                     &NavigationStateMachine::costmapCallback, this);
     costmap_updated_ = false;
 
-    ROS_INFO("导航状态机初始化完成 - 集成costmap版本");
-
+    ROS_INFO("导航状态机初始化完成 - 带智能停止功能");
 }
 
 void NavigationStateMachine::execute() {
@@ -104,7 +123,6 @@ void NavigationStateMachine::handleWaitingQRService() {
             ros::Duration(0.5).sleep();
         }
     } else {
-        // 服务已调用，等待导航完成或其他处理
         ROS_INFO_THROTTLE(5, "[WAITING_QR_SERVICE] 等待二维码识别结果...");
     }
 }
@@ -119,28 +137,138 @@ void NavigationStateMachine::handleMoveToPickZone() {
 }
 
 void NavigationStateMachine::handleScanningBoards() {
-    ROS_INFO("[SCANNING_BOARDS] 开始扫描识别板");
-    speak("正在扫描识别板位置");
+    static bool first_enter = true;
     
-    // 在开始扫描前获取一次机器人位姿，避免在回调中频繁查询TF
-    if (!getRobotPose(scan_robot_x_, scan_robot_y_, scan_robot_yaw_)) {
-        ROS_WARN("无法获取机器人位姿，延迟扫描");
+    if (first_enter) {
+        ROS_INFO("[SCANNING_BOARDS] 开始扫描识别板");
+        speak("正在扫描识别板位置");
+        
+        clusters_calculated_ = false;
+
+        if (!getRobotPose(scan_robot_x_, scan_robot_y_, scan_robot_yaw_)) {
+            ROS_WARN("无法获取机器人位姿，延迟扫描");
+            return;
+        }
+        
+        current_target_cluster_ = -1;
+        clusters_detected_ = false;
+        detected_clusters_.clear();
+        rotation_optimization_active_ = false;
+        object_detected_during_scan_ = false;
+        
+        scan_start_time_ = ros::Time::now();
+        
+        ROS_INFO("扫描开始，等待识别板检测...");
+        first_enter = false;
         return;
     }
     
-    ROS_INFO("扫描起始位姿: (%.2f, %.2f, %.1f°)", 
-             scan_robot_x_, scan_robot_y_, scan_robot_yaw_ * 180 / M_PI);
+    if (rotation_optimization_active_ && object_detected_during_scan_) {
+        ROS_INFO("旋转过程中检测到目标物体，立即停止旋转");
+        
+        geometry_msgs::Twist stop_cmd;
+        stop_cmd.angular.z = 0.0;
+        cmd_vel_pub_.publish(stop_cmd);
+        
+        // 重要：等待机器人完全停止
+        ros::Duration(0.5).sleep();
+        
+        // 更新当前位姿
+        if (!getRobotPose(scan_robot_x_, scan_robot_y_, scan_robot_yaw_)) {
+            ROS_WARN("停止后获取位姿失败");
+        }
+        
+        // 重新计算簇排序（基于当前朝向）
+        selectBestCluster();
+        
+        if (current_target_cluster_ >= 0 && current_target_cluster_ < detected_clusters_.size()) {
+            ROS_INFO("选择第 %d 个识别板，切换到导航状态", current_target_cluster_ + 1);
+            setState(RobotState::NAVIGATING_TO_BOARD);
+        } else {
+            ROS_WARN("无法选择合适识别板，前往等待区");
+            speak("识别板选择失败，继续执行");
+            setState(RobotState::MOVE_TO_WAIT_ZONE);
+        }
+        
+        first_enter = true;
+        rotation_optimization_active_ = false;
+        object_detected_during_scan_ = false;
+        return;
+    }
     
-    // 触发激光检测
-    stopMoving();
-    current_target_cluster_ = -1;
-    clusters_detected_ = false;
-    detected_clusters_.clear();
+    if (!rotation_optimization_active_ && clusters_detected_ && !detected_clusters_.empty()) {
+        ROS_INFO("检测到 %zu 个识别板，开始旋转优化预计算", detected_clusters_.size());
+        rotation_optimization_active_ = true;
+        rotation_start_yaw_ = scan_robot_yaw_;
+        rotation_start_time_ = ros::Time::now();
+        
+        geometry_msgs::Twist rotate_cmd;
+        rotate_cmd.angular.z = 0.5f;
+        cmd_vel_pub_.publish(rotate_cmd);
+        
+        ROS_INFO("开始旋转优化，目标角度: 180度");
+        return;
+    }
     
-    // 设置超时机制
-    scan_start_time_ = ros::Time::now();
+    if (rotation_optimization_active_) {
+        float current_x, current_y, current_yaw;
+        if (!getRobotPose(current_x, current_y, current_yaw)) {
+            ROS_WARN("获取当前朝向失败，继续旋转");
+            return;
+        }
+        
+        float rotated_angle = fabs(current_yaw - rotation_start_yaw_);
+        if (rotated_angle > M_PI) {
+            rotated_angle = 2 * M_PI - rotated_angle;
+        }
+        
+        ROS_INFO_THROTTLE(1, "旋转优化: %.1f°/180°", rotated_angle * 180 / M_PI);
+        
+        bool should_stop = false;
+        std::string stop_reason;
+        
+        if (rotated_angle >= M_PI) {
+            should_stop = true;
+            stop_reason = "旋转角度达到目标";
+        } else if ((ros::Time::now() - rotation_start_time_).toSec() > 12.0) {
+            should_stop = true;
+            stop_reason = "旋转超时";
+        }
+        
+        if (should_stop) {
+            ROS_INFO("停止旋转优化: %s", stop_reason.c_str());
+            
+            geometry_msgs::Twist stop_cmd;
+            stop_cmd.angular.z = 0.0;
+            cmd_vel_pub_.publish(stop_cmd);
+            
+            selectBestCluster();
+            
+            if (current_target_cluster_ >= 0 && current_target_cluster_ < detected_clusters_.size()) {
+                ROS_INFO("选择第 %d 个识别板，切换到导航状态", current_target_cluster_ + 1);
+                setState(RobotState::NAVIGATING_TO_BOARD);
+            } else {
+                ROS_WARN("无法选择合适识别板，前往等待区");
+                speak("识别板选择失败，继续执行");
+                setState(RobotState::MOVE_TO_WAIT_ZONE);
+            }
+            
+            first_enter = true;
+            rotation_optimization_active_ = false;
+        }
+        return;
+    }
     
-    ROS_INFO("开始激光扫描，等待检测结果...");
+    if (!clusters_detected_ || detected_clusters_.empty()) {
+        ROS_INFO_THROTTLE(2, "等待识别板检测...");
+        
+        if ((ros::Time::now() - scan_start_time_).toSec() > LASER_SCAN_TIMEOUT) {
+            ROS_WARN("扫描总超时，未检测到识别板");
+            speak("未找到识别板，继续执行");
+            setState(RobotState::MOVE_TO_WAIT_ZONE);
+            first_enter = true;
+        }
+    }
 }
 
 void NavigationStateMachine::handleNavigatingToBoard() {
@@ -149,8 +277,6 @@ void NavigationStateMachine::handleNavigatingToBoard() {
         
         geometry_msgs::Point target_point = detected_clusters_[current_target_cluster_];
         float board_yaw = detected_cluster_infos_[current_target_cluster_].board_yaw;
-        
-        // 机器人朝向：正对板子
         float robot_target_yaw = board_yaw;
         
         ROS_INFO("[NAVIGATING_TO_BOARD] 前往第 %d 个识别板", current_target_cluster_ + 1);
@@ -158,14 +284,14 @@ void NavigationStateMachine::handleNavigatingToBoard() {
         ROS_INFO("  板子朝向: %.1f°", board_yaw * 180 / M_PI);
         ROS_INFO("  机器人目标朝向: %.1f°", robot_target_yaw * 180 / M_PI);
         
-        // 发送导航目标
         move_base_msgs::MoveBaseGoal goal;
         goal.target_pose = createPose(target_point.x, target_point.y, robot_target_yaw);
         goal.target_pose.header.stamp = ros::Time::now();
         goal.target_pose.header.frame_id = "map";
         
+        // 使用标准回调，智能停止由 navFeedbackCallback 处理
         action_client_.sendGoal(goal,
-            boost::bind(&NavigationStateMachine::clusterArrivedCallback, this, _1, _2),
+            boost::bind(&NavigationStateMachine::navDoneCallback, this, _1, _2),
             boost::bind(&NavigationStateMachine::navActiveCallback, this),
             boost::bind(&NavigationStateMachine::navFeedbackCallback, this, _1));
         
@@ -185,7 +311,6 @@ void NavigationStateMachine::handleWaitingVisual() {
     if (first_entered) {
         ROS_INFO("[WAITING_VISUAL] 到达识别板位置，等待视觉系统稳定");
 
-        // ========== 添加视觉状态重置 ==========
         try {
             std_srvs::Trigger reset_srv;
             ros::ServiceClient reset_client = nh_.serviceClient<std_srvs::Trigger>("/reset_vision_state");
@@ -206,10 +331,9 @@ void NavigationStateMachine::handleWaitingVisual() {
         } catch (const std::exception& e) {
             ROS_WARN("视觉重置服务异常: %s", e.what());
         }
-        // ========== 重置结束 ==========
 
         wait_start_time = ros::Time::now();
-        detection_start_time = ros::Time::now() + ros::Duration(1.5); // 1.5秒后开始正式检测
+        detection_start_time = ros::Time::now() + ros::Duration(1.5);
         first_entered = false;
         initial_delay_passed = false;
         same_object_count = 0;
@@ -217,7 +341,6 @@ void NavigationStateMachine::handleWaitingVisual() {
         return;
     }
     
-    // 检查是否过了初始延迟期
     if (!initial_delay_passed) {
         if (ros::Time::now() < detection_start_time) {
             ROS_INFO_THROTTLE(1, "[WAITING_VISUAL] 等待视觉系统稳定...");
@@ -228,20 +351,16 @@ void NavigationStateMachine::handleWaitingVisual() {
         }
     }
     
-    // 持续调用识别服务
     std_srvs::Trigger srv;
     if (object_service_client_.call(srv)) {
-        // 移除对srv.response.success的检查，因为视觉节点总是返回success
         std::string current_object = srv.response.message;
         
-        // 处理"继续检测"标记
         if (current_object == "CONTINUE_DETECTING") {
             ROS_INFO_THROTTLE(2, "视觉系统正在检测中，继续等待...");
             ros::Duration(0.3).sleep();
             return;
         }
         
-        // 处理"未检测到物体"标记
         if (current_object == "NO_OBJECT_DETECTED") {
             ROS_INFO_THROTTLE(2, "当前未检测到任何物体，继续等待...");
             same_object_count = 0;
@@ -250,9 +369,7 @@ void NavigationStateMachine::handleWaitingVisual() {
             return;
         }
         
-        // 检查是否与任务匹配
         if (current_object.find("WARN:") != 0) {
-            // 匹配的物体
             if (current_object == last_detected_object) {
                 same_object_count++;
                 ROS_INFO("持续检测到: %s, 连续计数: %d", current_object.c_str(), same_object_count);
@@ -262,8 +379,7 @@ void NavigationStateMachine::handleWaitingVisual() {
                 ROS_INFO("检测到新物体: %s, 开始计数", current_object.c_str());
             }
             
-            // 连续5次检测到同一物体确认识别成功
-            if (same_object_count >= 5) {
+            if (same_object_count >= 3) {
                 ROS_INFO("物体识别确认: %s", current_object.c_str());
                 picked_object_ = current_object;
                 speak("识别到" + current_object);
@@ -271,7 +387,6 @@ void NavigationStateMachine::handleWaitingVisual() {
                 first_entered = true;
             }
         } else {
-            // 不匹配的物体 - 立即切换到下一个识别板
             std::string mismatched_object = current_object.substr(5);
             ROS_WARN("识别到不匹配物体: %s，立即切换到下一个识别板", mismatched_object.c_str());
             ros::Duration(0.2).sleep();
@@ -279,20 +394,17 @@ void NavigationStateMachine::handleWaitingVisual() {
             first_entered = true;
         }
     } else {
-        // 服务调用失败时，只记录错误但不切换识别板，等待超时处理
         ROS_ERROR_THROTTLE(2, "无法调用物体识别服务，等待重试...");
         ros::Duration(0.3).sleep();
-        return;  // 不切换识别板，继续等待
+        return;
     }
     
-    // 超时处理（15秒内没有确认）
-    if ((ros::Time::now() - wait_start_time).toSec() > 15.0) {
+    if ((ros::Time::now() - wait_start_time).toSec() > VISUAL_RECOGNITION_TIMEOUT) {
         ROS_WARN("视觉识别超时，前往下一个识别板");
         moveToNextCluster();
         first_entered = true;
     }
     
-    // 限制调用频率
     ros::Duration(0.3).sleep();
 }
 
@@ -302,7 +414,6 @@ void NavigationStateMachine::handleObjectConfirmed() {
     task_flags_.object_picked = true;
     updateCostCalculation(picked_object_);
     
-    // 重置状态
     moving_to_cluster_ = false;
     current_target_cluster_ = -1;
     object_service_called_ = false;
@@ -413,11 +524,9 @@ void NavigationStateMachine::handleErrorState() {
     ROS_ERROR("[ERROR] 进入错误状态，尝试恢复...");
     speak("导航出现问题，尝试恢复");
     
-    // 取消所有目标
     action_client_.cancelAllGoals();
     stopMoving();
     
-    // 根据当前任务状态决定恢复策略
     if (task_flags_.object_picked) {
         ROS_INFO("恢复：前往等待区");
         setState(RobotState::MOVE_TO_WAIT_ZONE);
@@ -432,7 +541,6 @@ void NavigationStateMachine::handleErrorState() {
 // ========== 激光雷达相关函数 ==========
 
 void NavigationStateMachine::laserCallback(const sensor_msgs::LaserScan::ConstPtr& msg) {
-    // 障碍物检测
     int center_index = msg->ranges.size() / 2;
     int range = 30 * M_PI / 180.0 / msg->angle_increment;
     
@@ -448,32 +556,52 @@ void NavigationStateMachine::laserCallback(const sensor_msgs::LaserScan::ConstPt
     obstacle_distance_ = min_distance;
     obstacle_detected_ = (min_distance <= TARGET_OBSTACLE_DISTANCE);
     
-    // 在SCANNING_BOARDS状态时检测物体簇
-    if (current_state_ == RobotState::SCANNING_BOARDS && !clusters_detected_) {
-        // 使用预先获取的机器人位姿，避免在回调中频繁查询TF
-        detectObjectClusters(msg);
-        
-        // 检测完成后直接触发状态转换
-        if (clusters_detected_ && !detected_clusters_.empty()) {
-            ROS_INFO("检测完成，发现 %zu 个识别板，开始选择最佳目标", detected_clusters_.size());
-            
-            // 选择最佳簇
-            selectBestCluster();
-            
-            if (current_target_cluster_ >= 0 && current_target_cluster_ < detected_clusters_.size()) {
-                ROS_INFO("选择第 %d 个识别板，切换到导航状态", current_target_cluster_ + 1);
-                setState(RobotState::NAVIGATING_TO_BOARD);
-            }
+    if (current_state_ == RobotState::SCANNING_BOARDS) {
+        if (!getRobotPose(scan_robot_x_, scan_robot_y_, scan_robot_yaw_)) {
+            ROS_WARN_THROTTLE(2, "扫描状态获取位姿失败");
+            return;
         }
         
-        // 超时处理
-        if ((ros::Time::now() - scan_start_time_).toSec() > 5.0) {
-            ROS_WARN("激光扫描超时，继续执行");
-            if (!clusters_detected_) {
-                speak("未找到识别板，继续执行");
-                setState(RobotState::MOVE_TO_WAIT_ZONE);
+        if (!clusters_calculated_ && !rotation_optimization_active_) {
+            detectObjectClusters(msg);
+            
+            if (!detected_clusters_.empty()) {
+                clusters_detected_ = true;
+                clusters_calculated_ = true;
+                ROS_DEBUG_THROTTLE(2, "检测到 %zu 个识别板", detected_clusters_.size());
             }
         }
+    }
+}
+
+void NavigationStateMachine::objectDetectedCallback(const std_msgs::String::ConstPtr& msg) {
+    std::string detected_object = msg->data;
+    
+    if (detected_object.empty()) {
+        return;
+    }
+    
+    if (!current_task_.empty()) {
+        bool is_fruit = (detected_object == "香蕉" || detected_object == "西瓜" || detected_object == "苹果");
+        bool is_food = (detected_object == "蛋糕" || detected_object == "牛奶" || detected_object == "可乐");
+        bool is_vegetable = (detected_object == "土豆" || detected_object == "番茄" || detected_object == "辣椒");
+        
+        bool task_matched = false;
+        if (current_task_ == "水果" && is_fruit) task_matched = true;
+        else if (current_task_ == "食品" && is_food) task_matched = true;
+        else if (current_task_ == "蔬菜" && is_vegetable) task_matched = true;
+        
+        if (!task_matched) {
+            ROS_WARN("检测到物体但与任务不匹配: %s (需要: %s)", detected_object.c_str(), current_task_.c_str());
+            return;
+        }
+    }
+    
+    ROS_INFO("检测到目标物体: %s", detected_object.c_str());
+    
+    if (current_state_ == RobotState::SCANNING_BOARDS) {
+        object_detected_during_scan_ = true;
+        detected_object_name_ = detected_object;
     }
 }
 
@@ -511,26 +639,35 @@ geometry_msgs::Point NavigationStateMachine::calculateSafeTarget(const ClusterIn
     return safe_target;
 }
 
-
-
 void NavigationStateMachine::detectObjectClusters(const sensor_msgs::LaserScan::ConstPtr& scan) {
     detected_clusters_.clear();
     detected_cluster_infos_.clear(); 
 
-    ROS_INFO("=== 动态聚类识别板检测 ===");
+    // 添加静态变量控制输出频率
+    static bool first_detection = true;
+    static ros::Time last_output_time = ros::Time::now();
     
+    // 只在第一次检测或超过3秒时输出详细信息
+    bool should_output_details = first_detection || 
+                                (ros::Time::now() - last_output_time).toSec() > 3.0;
+    
+    if (should_output_details) {
+        ROS_INFO("=== 动态聚类识别板检测 ===");
+        first_detection = false;
+        last_output_time = ros::Time::now();
+    }
+
     std::vector<std::vector<int>> clusters;
     std::vector<int> current_cluster;
     
     const float MAX_DISTANCE_JUMP = 0.1f;
-    const float MIN_VALID_RANGE = 0.4f;
+    const float MIN_VALID_RANGE = 0.1f;
     const float MAX_VALID_RANGE = 4.0f;
     
-    // 动态聚类算法
+    // 动态聚类算法（移除内部调试输出）
     for (size_t i = 0; i < scan->ranges.size(); ++i) {
         float dist = scan->ranges[i];
         
-        // 过滤无效点
         if (!std::isfinite(dist) || dist < MIN_VALID_RANGE || dist > MAX_VALID_RANGE) {
             if (!current_cluster.empty() && current_cluster.size() >= 5) {
                 clusters.push_back(current_cluster);
@@ -544,7 +681,6 @@ void NavigationStateMachine::detectObjectClusters(const sensor_msgs::LaserScan::
             continue;
         }
         
-        // 计算与前一点的实际物理距离
         int prev_idx = current_cluster.back();
         float prev_dist = scan->ranges[prev_idx];
         float prev_angle = scan->angle_min + prev_idx * scan->angle_increment;
@@ -556,11 +692,9 @@ void NavigationStateMachine::detectObjectClusters(const sensor_msgs::LaserScan::
         float y2 = dist * sin(curr_angle);
         float physical_distance = sqrt(pow(x2 - x1, 2) + pow(y2 - y1, 2));
         
-        // 根据物理距离判断是否属于同一物体
         if (physical_distance < MAX_DISTANCE_JUMP) {
             current_cluster.push_back(i);
         } else {
-            // 结束当前簇
             if (current_cluster.size() >= 12) {
                 clusters.push_back(current_cluster);
             }
@@ -569,12 +703,13 @@ void NavigationStateMachine::detectObjectClusters(const sensor_msgs::LaserScan::
         }
     }
     
-    // 处理最后一个簇
     if (!current_cluster.empty() && current_cluster.size() >= 8) {
         clusters.push_back(current_cluster);
     }
     
-    ROS_INFO("动态聚类结果: %zu个候选簇", clusters.size());
+    if (should_output_details) {
+        ROS_INFO("动态聚类结果: %zu个候选簇", clusters.size());
+    }
     
     // 临时存储所有有效识别板
     std::vector<geometry_msgs::Point> temp_clusters;
@@ -584,24 +719,30 @@ void NavigationStateMachine::detectObjectClusters(const sensor_msgs::LaserScan::
         ClusterInfo cluster_info = calculateClusterInfo(cluster, scan);
         float length = calculateBoardLength(cluster, scan);
         
-        ROS_INFO("候选簇: 大小=%zu, 长度=%.3fm, 距离=%.2fm, 中心点=(%.2f, %.2f), 朝向=%.1f°", 
-                cluster.size(), length, cluster_info.average_distance, 
-                cluster_info.center.x, cluster_info.center.y, cluster_info.board_yaw * 180 / M_PI);
+        // 只在详细输出时显示候选簇信息
+        if (should_output_details) {
+            ROS_INFO("候选簇: 大小=%zu, 长度=%.3fm, 距离=%.2fm, 中心点=(%.2f, %.2f), 朝向=%.1f°", 
+                    cluster.size(), length, cluster_info.average_distance, 
+                    cluster_info.center.x, cluster_info.center.y, cluster_info.board_yaw * 180 / M_PI);
+        }
         
         if (isValidObjectCluster(cluster_info, cluster, scan)) {
             geometry_msgs::Point safe_target = calculateSafeTarget(cluster_info);
             temp_clusters.push_back(safe_target);
             temp_infos.push_back(cluster_info);
             
-            ROS_INFO("✅ 识别板: 原始位置(%.2f,%.2f) -> 安全位置(%.2f,%.2f), 朝向=%.1f°, 长度=%.3fm", 
-                    cluster_info.center.x, cluster_info.center.y,
-                    safe_target.x, safe_target.y, cluster_info.board_yaw * 180 / M_PI, length);
+            // 只在详细输出时显示接受信息
+            if (should_output_details) {
+                ROS_INFO("✅ 识别板: 原始位置(%.2f,%.2f) -> 安全位置(%.2f,%.2f), 朝向=%.1f°, 长度=%.3fm", 
+                        cluster_info.center.x, cluster_info.center.y,
+                        safe_target.x, safe_target.y, cluster_info.board_yaw * 180 / M_PI, length);
+            }
         }
     }
     
     // ========== 精简重复检测 ==========
     std::vector<bool> keep_flag(temp_clusters.size(), true);
-    const float DUPLICATE_DISTANCE = 0.3f;  // 重复判断距离阈值
+    const float DUPLICATE_DISTANCE = 0.3f;
     
     for (size_t i = 0; i < temp_clusters.size(); ++i) {
         if (!keep_flag[i]) continue;
@@ -614,7 +755,6 @@ void NavigationStateMachine::detectObjectClusters(const sensor_msgs::LaserScan::
             float distance = sqrt(dx*dx + dy*dy);
             
             if (distance < DUPLICATE_DISTANCE) {
-                // 保留距离机器人更近的点
                 float dist_i = sqrt(pow(temp_clusters[i].x - scan_robot_x_, 2) + 
                                    pow(temp_clusters[i].y - scan_robot_y_, 2));
                 float dist_j = sqrt(pow(temp_clusters[j].x - scan_robot_x_, 2) + 
@@ -622,12 +762,16 @@ void NavigationStateMachine::detectObjectClusters(const sensor_msgs::LaserScan::
                 
                 if (dist_i < dist_j) {
                     keep_flag[j] = false;
-                    ROS_INFO("过滤重复识别板: 保留索引%zu(距离%.2fm), 过滤索引%zu(距离%.2fm)", 
-                             i, dist_i, j, dist_j);
+                    if (should_output_details) {
+                        ROS_INFO("过滤重复识别板: 保留索引%zu(距离%.2fm), 过滤索引%zu(距离%.2fm)", 
+                                 i, dist_i, j, dist_j);
+                    }
                 } else {
                     keep_flag[i] = false;
-                    ROS_INFO("过滤重复识别板: 保留索引%zu(距离%.2fm), 过滤索引%zu(距离%.2fm)", 
-                             j, dist_j, i, dist_i);
+                    if (should_output_details) {
+                        ROS_INFO("过滤重复识别板: 保留索引%zu(距离%.2fm), 过滤索引%zu(距离%.2fm)", 
+                                 j, dist_j, i, dist_i);
+                    }
                     break;
                 }
             }
@@ -642,49 +786,41 @@ void NavigationStateMachine::detectObjectClusters(const sensor_msgs::LaserScan::
         }
     }
     
-    // ========== 精简优先级排序 ==========
-    if (!detected_clusters_.empty()) {
-        // 计算每个安全点相对于机器人的方向向量
+   // ========== 精简优先级排序 ==========
+ if (!detected_clusters_.empty()) {
         std::vector<std::pair<size_t, float>> point_scores;
         
         for (size_t i = 0; i < detected_clusters_.size(); ++i) {
-            float dx = detected_clusters_[i].x - scan_robot_x_;
-            float dy = detected_clusters_[i].y - scan_robot_y_;
-            float to_point_yaw = atan2(dy, dx);
+            float score = 0.0f;
             
-            // 计算与机器人朝向的夹角（绝对值）
+            float dx_to_robot = detected_clusters_[i].x - scan_robot_x_;
+            float dy_to_robot = detected_clusters_[i].y - scan_robot_y_;
+            float to_point_yaw = atan2(dy_to_robot, dx_to_robot);
             float angle_diff = fabs(to_point_yaw - scan_robot_yaw_);
             if (angle_diff > M_PI) angle_diff = 2 * M_PI - angle_diff;
             
-            // 评分：夹角越小得分越高（越在正前方）
-            float score = 1.0f - (angle_diff / M_PI);
-            point_scores.push_back({i, score});
+            float direction_score = 1.0f - (angle_diff / M_PI);
+            score = direction_score;
             
-            ROS_INFO("安全点[%zu]评分: 朝向差=%.1f°, 得分=%.2f", 
-                     i, angle_diff * 180/M_PI, score);
+            point_scores.push_back({i, score});
         }
         
-        // 按得分降序排序
         std::sort(point_scores.begin(), point_scores.end(), 
                   [](const auto& a, const auto& b) { return a.second > b.second; });
         
-        // 重新排列结果
         std::vector<geometry_msgs::Point> sorted_clusters;
         std::vector<ClusterInfo> sorted_infos;
-        
+
         for (const auto& item : point_scores) {
             sorted_clusters.push_back(detected_clusters_[item.first]);
             sorted_infos.push_back(detected_cluster_infos_[item.first]);
         }
-        
+
         detected_clusters_ = sorted_clusters;
         detected_cluster_infos_ = sorted_infos;
         
         ROS_INFO("安全点排序完成，优先检查正前方的识别板");
     }
-    
-    clusters_detected_ = !detected_clusters_.empty();
-    ROS_INFO("检测完成: 发现 %zu 个识别板", detected_clusters_.size());
 }
 
 NavigationStateMachine::ClusterInfo NavigationStateMachine::calculateClusterInfo(const std::vector<int>& cluster, 
@@ -786,12 +922,12 @@ bool NavigationStateMachine::isValidObjectCluster(const ClusterInfo& cluster_inf
              estimated_length, angular_width_deg, cluster_info.average_distance, cluster.size());
     
     // 验证条件
-    if (estimated_length < 0.2f || estimated_length > 0.7f) {
+    if (estimated_length < 0.2f || estimated_length > 0.9f) {
         ROS_DEBUG("长度不合适: %.3fm", estimated_length);
         return false;
     }
     
-    if (cluster_info.average_distance < 0.8f || cluster_info.average_distance > 3.0f) {
+    if (cluster_info.average_distance < 0.1f || cluster_info.average_distance > 3.0f) {
         ROS_DEBUG("距离不合适: %.2fm", cluster_info.average_distance);
         return false;
     }
@@ -817,16 +953,62 @@ void NavigationStateMachine::selectBestCluster() {
         return;
     }
     
-    // 强制从第一个识别板开始按顺序检查
-    current_target_cluster_ = 0;
-    
-    // 记录所有识别板位置用于调试
-    for (size_t i = 0; i < detected_clusters_.size(); ++i) {
-        ROS_INFO("识别板[%zu]: 位置(%.2f, %.2f)", 
-                 i, detected_clusters_[i].x, detected_clusters_[i].y);
+    // 获取当前机器人位姿
+    float current_x, current_y, current_yaw;
+    if (!getRobotPose(current_x, current_y, current_yaw)) {
+        ROS_WARN("无法获取当前位姿，使用默认选择");
+        current_target_cluster_ = 0;
+        return;
     }
     
-    ROS_INFO("选择第一个识别板开始顺序检查: 位置(%.2f, %.2f)", 
+    // 基于当前朝向重新排序
+    std::vector<std::pair<size_t, float>> point_scores;
+    
+    for (size_t i = 0; i < detected_clusters_.size(); ++i) {
+        float dx_to_robot = detected_clusters_[i].x - current_x;
+        float dy_to_robot = detected_clusters_[i].y - current_y;
+        float to_point_yaw = atan2(dy_to_robot, dx_to_robot);
+        
+        // 计算与当前朝向的角度差
+        float angle_diff = fabs(to_point_yaw - current_yaw);
+        if (angle_diff > M_PI) {
+            angle_diff = 2 * M_PI - angle_diff;
+        }
+        
+        // 评分：角度差越小，评分越高
+        float direction_score = 1.0f - (angle_diff / M_PI);
+        point_scores.push_back({i, direction_score});
+        
+        ROS_INFO("识别板[%zu]方向评分: 角度差=%.1f°, 得分=%.3f", 
+                 i, angle_diff * 180 / M_PI, direction_score);
+    }
+    
+    // 按评分排序
+    std::sort(point_scores.begin(), point_scores.end(), 
+              [](const auto& a, const auto& b) { return a.second > b.second; });
+    
+    // 重新排序簇
+    std::vector<geometry_msgs::Point> sorted_clusters;
+    std::vector<ClusterInfo> sorted_infos;
+
+    for (const auto& item : point_scores) {
+        sorted_clusters.push_back(detected_clusters_[item.first]);
+        sorted_infos.push_back(detected_cluster_infos_[item.first]);
+    }
+
+    detected_clusters_ = sorted_clusters;
+    detected_cluster_infos_ = sorted_infos;
+    
+    current_target_cluster_ = 0;
+    
+    ROS_INFO("=== 最终选择结果 ===");
+    for (size_t i = 0; i < detected_clusters_.size(); ++i) {
+        ROS_INFO("排序[%zu]: 位置(%.2f, %.2f), 原索引=%zu", 
+                 i, detected_clusters_[i].x, detected_clusters_[i].y, 
+                 point_scores[i].first);
+    }
+    
+    ROS_INFO("选择最优识别板[0]: 位置(%.2f, %.2f)", 
              detected_clusters_[0].x, detected_clusters_[0].y);
 }
 
@@ -933,9 +1115,9 @@ bool NavigationStateMachine::callQRService() {
 bool NavigationStateMachine::callObjectRecognitionService() {
     std_srvs::Trigger srv;
     
-    // 添加重试机制
+    // 使用定义的常量
     int retry_count = 0;
-    const int max_retries = 3;
+    const int max_retries = SERVICE_RETRY_COUNT;
     
     while (retry_count < max_retries) {
         if (object_service_client_.call(srv)) {
@@ -989,8 +1171,20 @@ void NavigationStateMachine::navDoneCallback(const actionlib::SimpleClientGoalSt
                                             const move_base_msgs::MoveBaseResultConstPtr& result) {
     task_flags_.navigation_in_progress = false;
 
-    ROS_INFO("导航完成回调 - 状态: %s, 目标点: %s", 
-             state.toString().c_str(), current_goal_point_.c_str());
+    ROS_INFO("导航完成回调 - 状态: %s, 目标点: %s, 当前状态: %d", 
+             state.toString().c_str(), current_goal_point_.c_str(), static_cast<int>(current_state_));
+
+    // 如果当前状态已经不是导航状态，忽略这个回调
+    if (current_state_ != RobotState::MOVE_TO_QR_ZONE &&
+        current_state_ != RobotState::MOVE_TO_PICK_ZONE &&
+        current_state_ != RobotState::MOVE_TO_WAIT_ZONE &&
+        current_state_ != RobotState::MOVE_TO_TRAFFIC_ZONE &&
+        current_state_ != RobotState::MOVE_TO_INTERSECTION &&
+        current_state_ != RobotState::NAVIGATE_TO_FINISH &&
+        current_state_ != RobotState::NAVIGATING_TO_BOARD) {
+        ROS_INFO("忽略导航回调，当前状态 %d 不是导航状态", static_cast<int>(current_state_));
+        return;
+    }
 
     if (state == actionlib::SimpleClientGoalState::SUCCEEDED) {
         ROS_INFO("导航目标成功到达: %s", current_goal_point_.c_str());
@@ -1014,14 +1208,42 @@ void NavigationStateMachine::navDoneCallback(const actionlib::SimpleClientGoalSt
             case RobotState::NAVIGATE_TO_FINISH:
                 setState(RobotState::TASK_COMPLETE);
                 break;
+            case RobotState::NAVIGATING_TO_BOARD:
+                // 正常情况下，NAVIGATING_TO_BOARD 应该由智能停止处理
+                // 如果走到这里，说明智能停止没触发，直接进入视觉状态
+                ROS_WARN("NAVIGATING_TO_BOARD 导航完成，但智能停止未触发");
+                moving_to_cluster_ = false;
+                setState(RobotState::WAITING_VISUAL);
+                break;
             default:
                 ROS_WARN("导航完成但当前状态 %d 不需要处理", static_cast<int>(current_state_));
                 break;
         }
     } else {
+        // 特别处理被取消的情况
+        if (state == actionlib::SimpleClientGoalState::PREEMPTED) {
+            ROS_INFO("导航被取消: %s", state.getText().c_str());
+            
+            // 如果是识别板导航被智能停止取消，这是正常行为
+            if (current_state_ == RobotState::NAVIGATING_TO_BOARD) {
+                ROS_INFO("识别板导航被智能停止取消，正常行为");
+                moving_to_cluster_ = false;
+                // 状态已经由智能停止设置了，不需要重复设置
+                return;
+            }
+        }
+        
         ROS_ERROR("导航目标失败: %s - %s", 
                  state.toString().c_str(), state.getText().c_str());
-        setState(RobotState::ERROR);
+        
+        // 特别处理识别板导航失败
+        if (current_state_ == RobotState::NAVIGATING_TO_BOARD) {
+            moving_to_cluster_ = false;
+            ROS_WARN("识别板导航真正失败，尝试下一个");
+            moveToNextCluster();
+        } else {
+            setState(RobotState::ERROR);
+        }
     }
 }
 
@@ -1029,10 +1251,136 @@ void NavigationStateMachine::navActiveCallback() {
     ROS_INFO("导航目标已激活: %s", current_goal_point_.c_str());
 }
 
+// ========== 智能停止核心函数 ==========
+
 void NavigationStateMachine::navFeedbackCallback(const move_base_msgs::MoveBaseFeedbackConstPtr& feedback) {
     ROS_INFO_THROTTLE(5, "导航反馈 - 当前位置: (%.2f, %.2f)", 
                      feedback->base_position.pose.position.x,
                      feedback->base_position.pose.position.y);
+    
+    // === 智能停止：针对所有固定导航点和识别板导航 ===
+    switch(current_state_) {
+        case RobotState::NAVIGATING_TO_BOARD:
+            handleBoardNavigationStop(feedback);
+            break;
+        case RobotState::MOVE_TO_QR_ZONE:
+        case RobotState::MOVE_TO_PICK_ZONE:
+        case RobotState::MOVE_TO_WAIT_ZONE:
+        case RobotState::MOVE_TO_TRAFFIC_ZONE:
+        case RobotState::MOVE_TO_INTERSECTION:
+        case RobotState::NAVIGATE_TO_FINISH:
+            handleFixedPointNavigationStop(feedback);
+            break;
+        default:
+            // 其他状态不需要智能停止
+            break;
+    }
+}
+
+void NavigationStateMachine::handleBoardNavigationStop(const move_base_msgs::MoveBaseFeedbackConstPtr& feedback) {
+    // 安全检查
+    if (current_target_cluster_ < 0 || current_target_cluster_ >= detected_clusters_.size()) {
+        return;
+    }
+    
+    // 获取识别板目标点
+    geometry_msgs::Point target_point = detected_clusters_[current_target_cluster_];
+    float target_yaw = detected_cluster_infos_[current_target_cluster_].board_yaw;
+    
+    // 计算距离
+    float dx = feedback->base_position.pose.position.x - target_point.x;
+    float dy = feedback->base_position.pose.position.y - target_point.y;
+    float distance = sqrt(dx*dx + dy*dy);
+    
+    // 计算角度差
+    float current_yaw = getYawFromPose(feedback->base_position.pose);
+    float yaw_diff = fabs(current_yaw - target_yaw);
+    if (yaw_diff > M_PI) yaw_diff = 2 * M_PI - yaw_diff;
+    
+    // 检查是否满足容差
+    if (distance <= 0.18f && yaw_diff <= 0.2f) {
+        ROS_INFO("到达识别板位置！主动停止导航");
+        action_client_.cancelAllGoals();
+        stopMoving();
+        
+        // 状态切换
+        moving_to_cluster_ = false;
+        task_flags_.navigation_in_progress = false;  // 重要：重置导航标志
+        setState(RobotState::WAITING_VISUAL);
+    }
+}
+
+void NavigationStateMachine::handleFixedPointNavigationStop(const move_base_msgs::MoveBaseFeedbackConstPtr& feedback) {
+    auto it = navigation_points_.find(current_goal_point_);
+    if (it == navigation_points_.end()) {
+        return;
+    }
+    
+    geometry_msgs::Pose target_pose = it->second.pose;
+    
+    // 计算距离
+    float dx = feedback->base_position.pose.position.x - target_pose.position.x;
+    float dy = feedback->base_position.pose.position.y - target_pose.position.y;
+    float distance = sqrt(dx*dx + dy*dy);
+    
+    // 计算角度差
+    float target_yaw = getYawFromPose(target_pose);
+    float current_yaw = getYawFromPose(feedback->base_position.pose);
+    float yaw_diff = fabs(current_yaw - target_yaw);
+    if (yaw_diff > M_PI) yaw_diff = 2 * M_PI - yaw_diff;
+    
+    // 根据目标类型设置不同的停止阈值
+    float distance_threshold = 0.15f;
+    float yaw_threshold = 0.3f;
+    
+    // 终点区域使用更严格的阈值
+    if (current_goal_point_.find("finish_zone") != std::string::npos) {
+        distance_threshold = 0.12f;
+        yaw_threshold = 0.25f;
+    }
+    
+    // 检查是否满足容差
+    if (distance <= distance_threshold && yaw_diff <= yaw_threshold) {
+        ROS_INFO("到达 %s 位置！主动停止导航 (距离: %.3fm, 角度差: %.1f°)", 
+                 current_goal_point_.c_str(), distance, yaw_diff * 180 / M_PI);
+        action_client_.cancelAllGoals();
+        stopMoving();
+        
+        // 状态切换
+        task_flags_.navigation_in_progress = false;
+        triggerStateTransition(current_goal_point_);
+    }
+}
+
+void NavigationStateMachine::triggerStateTransition(const std::string& goal_name) {
+    if (goal_name == "qr_zone") {
+        setState(RobotState::WAITING_QR_SERVICE);
+    } else if (goal_name == "pick_zone") {
+        setState(RobotState::SCANNING_BOARDS);
+    } else if (goal_name == "wait_zone") {
+        setState(RobotState::WAITING_SIMULATION);
+    } else if (goal_name == "traffic_zone") {
+        setState(RobotState::WAITING_TRAFFIC);
+    } else if (goal_name == "intersection_A" || goal_name == "intersection_B") {
+        setState(RobotState::NAVIGATE_TO_FINISH);
+    } else if (goal_name == "finish_zone_A" || goal_name == "finish_zone_B") {
+        setState(RobotState::TASK_COMPLETE);
+    } else {
+        ROS_WARN("未知的目标点 %s，无法触发状态转换", goal_name.c_str());
+    }
+}
+
+float NavigationStateMachine::getYawFromPose(const geometry_msgs::Pose& pose) {
+    tf2::Quaternion q(
+        pose.orientation.x,
+        pose.orientation.y, 
+        pose.orientation.z,
+        pose.orientation.w
+    );
+    tf2::Matrix3x3 m(q);
+    double roll, pitch, yaw;
+    m.getRPY(roll, pitch, yaw);
+    return yaw;
 }
 
 // ========== 工具函数 ==========
@@ -1080,6 +1428,12 @@ void NavigationStateMachine::setState(RobotState new_state) {
         }
     }
     
+    // === 新增：当离开扫描状态时重置簇计算标志 ===
+    if (current_state_ == RobotState::SCANNING_BOARDS && 
+        new_state != RobotState::SCANNING_BOARDS) {
+        clusters_calculated_ = false;
+    }
+
     ROS_INFO("状态转换: %d -> %d", 
              static_cast<int>(current_state_), 
              static_cast<int>(new_state));
@@ -1088,8 +1442,8 @@ void NavigationStateMachine::setState(RobotState new_state) {
 
 void NavigationStateMachine::loadNavigationPoints() {
     navigation_points_["qr_zone"] = createPose(1.35, 0.92, 3.14);
-    navigation_points_["pick_zone"] = createPose(1.7, 5.45, 0.0);
-    navigation_points_["wait_zone"] = createPose(1.63, 6.34, 0.0);
+    navigation_points_["pick_zone"] = createPose(1.7, 5.35, 0.0);
+    navigation_points_["wait_zone"] = createPose(1.7, 6.34, 0.0);
     navigation_points_["traffic_zone"] = createPose(4.9, 6.4, 1.57); 
     navigation_points_["intersection_A"] = createPose(4.2, 4.3, -1.57);
     navigation_points_["intersection_B"] = createPose(7.3, 4.6, -1.57);
