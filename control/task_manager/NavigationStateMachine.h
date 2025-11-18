@@ -113,6 +113,11 @@ private:
     static constexpr int VISUAL_RECOGNITION_TIMEOUT = 15;    // 视觉识别超时时间（s）
     static constexpr int SERVICE_RETRY_COUNT = 3;            // 服务调用重试次数
 
+     // === 旋转优化控制变量 ===
+    bool rotation_optimization_active_ = false;
+    float rotation_start_yaw_ = 0.0f;
+    ros::Time rotation_start_time_;
+
     // ========== ROS 通信成员 ==========
     ros::NodeHandle nh_;                                      // 节点句柄
     
@@ -129,6 +134,7 @@ private:
     ros::Subscriber simulation_sub_;     // 仿真结果订阅器（/demo/simulation_result）
     ros::Subscriber traffic_sub_;        // 路牌识别结果订阅器（/demo/traffic_result）
     ros::Subscriber costmap_sub_;        // 代价地图订阅器（/move_base/global_costmap/costmap）
+    ros::Subscriber object_detected_sub_; // 新增：物体检测信号订阅器（/object_detected）
 
     // 服务客户端
     ros::ServiceClient qr_service_client_;       // 二维码识别服务客户端（/qr_recognition）
@@ -150,6 +156,10 @@ private:
     std::string current_goal_point_;          // 当前导航目标点名称
     double total_cost_ = 0.0;                 // 任务总花费
     
+    // 物体检测相关
+    bool object_detected_during_scan_ = false;  // 扫描过程中是否检测到目标物体
+    std::string detected_object_name_;          // 检测到的物体名称
+    
     // 导航点配置
     std::map<std::string, geometry_msgs::PoseStamped> navigation_points_;  // 预定义导航点
 
@@ -160,9 +170,10 @@ private:
     // 激光雷达聚类相关
     std::vector<geometry_msgs::Point> detected_clusters_;       // 检测到的识别板安全目标点
     std::vector<ClusterInfo> detected_cluster_infos_;           // 检测到的识别板聚类详细信息
-    int current_target_cluster_ = -1;                            // 当前目标识别板索引
-    bool clusters_detected_ = false;                             // 是否检测到识别板聚类
-    bool moving_to_cluster_ = false;                             // 是否正在导航到识别板
+    bool clusters_calculated_ = false;         // 标记是否已计算过簇
+    int current_target_cluster_ = -1;          // 当前目标识别板索引
+    bool clusters_detected_ = false;           // 是否检测到识别板聚类
+    bool moving_to_cluster_ = false;           // 是否正在导航到识别板
 
     // 障碍物检测
     float obstacle_distance_ = std::numeric_limits<float>::max();  // 最近障碍物距离（m）
@@ -220,6 +231,12 @@ private:
     void navFeedbackCallback(const move_base_msgs::MoveBaseFeedbackConstPtr& feedback);
     void clusterArrivedCallback(const actionlib::SimpleClientGoalState& state, const move_base_msgs::MoveBaseResultConstPtr& result);
 
+    // 智能停止核心函数（新增）
+    void handleBoardNavigationStop(const move_base_msgs::MoveBaseFeedbackConstPtr& feedback);
+    void handleFixedPointNavigationStop(const move_base_msgs::MoveBaseFeedbackConstPtr& feedback);
+    void triggerStateTransition(const std::string& goal_name);
+    float getYawFromPose(const geometry_msgs::Pose& pose);
+
     // 服务调用
     bool callQRService();
     bool callObjectRecognitionService();
@@ -230,7 +247,6 @@ private:
 
     // 代价地图处理
     void costmapCallback(const nav_msgs::OccupancyGrid::ConstPtr& msg);
-    bool isPointReachable(const geometry_msgs::Point& point);
     bool isTargetReachable(const geometry_msgs::Point& point);
 
     // 工具函数
@@ -241,6 +257,7 @@ private:
     void updateCostCalculation(const std::string& object);  // 更新任务花费
 
     // 数据回调
+    void objectDetectedCallback(const std_msgs::String::ConstPtr& msg);  // 物体检测回调
     void simulationCallback(const std_msgs::String::ConstPtr& msg);
     void trafficCallback(const std_msgs::String::ConstPtr& msg);
 };
