@@ -9,10 +9,15 @@ project(test_pkg)
 ## is used, also find other catkin packages
 find_package(catkin REQUIRED COMPONENTS
   roscpp
-  rospy
   std_msgs
-  actionlib  
-  move_base_msgs  
+  geometry_msgs
+  sensor_msgs
+  actionlib
+  actionlib_msgs
+  move_base_msgs
+  tf2
+  tf2_ros
+  tf2_geometry_msgs
 )
 
 ## System dependencies are found with CMake's conventions
@@ -234,4 +239,9 @@ target_link_libraries(new_nav_client
   ${catkin_LIBRARIES}
 )
 
+add_executable(SimulationStateMachine 
+    src/simulation_main.cpp 
+    src/SimulationStateMachine.cpp
+)
 
+target_link_libraries(SimulationStateMachine ${catkin_LIBRARIES})
