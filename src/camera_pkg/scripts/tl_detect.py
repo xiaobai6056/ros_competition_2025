@@ -16,7 +16,7 @@ class TrafficLightDetect:
         
 
         
-        rospy.Subscriber("/detect/raw_image", Image, self.image_callback)
+        rospy.Subscriber("/cam", Image, self.image_callback)
         self.tl_info_pub = rospy.Publisher("/demo/traffic_result", String, queue_size=10)
         self.final_img_pub = rospy.Publisher("/detect/final_image", Image, queue_size=10)
         rospy.loginfo("交通信号灯识别节点已启动，发布结果到 /demo/traffic_result")
