@@ -38,8 +38,15 @@ NavigationStateMachine::NavigationStateMachine(ros::NodeHandle& nh)
       clusters_detected_(false),
       moving_to_cluster_(false),
       qr_service_called_(false),
-      object_service_called_(false)
+      object_service_called_(false),
+      current_waypoint_index_(0),
+      following_waypoint_sequence_(false),
+      waypoint_switch_distance_(0.8f)
 {
+    // 初始化状态时间统计
+    state_start_time_ = ros::Time::now();
+    state_durations_.clear();
+    
     // 等待action server
     ROS_INFO("等待move_base action server...");
     if (action_client_.waitForServer(ros::Duration(5.0))) {
@@ -70,10 +77,18 @@ NavigationStateMachine::NavigationStateMachine(ros::NodeHandle& nh)
                                     &NavigationStateMachine::costmapCallback, this);
     costmap_updated_ = false;
 
-    ROS_INFO("导航状态机初始化完成 - 带智能停止功能");
+    ROS_INFO("导航状态机初始化完成 - 带中继点导航功能");
 }
 
 void NavigationStateMachine::execute() {
+    // 状态时间统计
+    static ros::Time last_execute_time = ros::Time::now();
+    ros::Time current_time = ros::Time::now();
+    double time_in_state = (current_time - state_start_time_).toSec();
+    
+    ROS_INFO_THROTTLE(10, "[状态时间统计] 当前状态 %d 已持续: %.1f 秒", 
+                     static_cast<int>(current_state_), time_in_state);
+    
     switch(current_state_) {
         case RobotState::INIT: handleInitState(); break;
         case RobotState::MOVE_TO_QR_ZONE: handleMoveToQRZone(); break;
@@ -87,11 +102,12 @@ void NavigationStateMachine::execute() {
         case RobotState::WAITING_SIMULATION: handleWaitingSimulation(); break;
         case RobotState::MOVE_TO_TRAFFIC_ZONE: handleMoveToTrafficZone(); break;
         case RobotState::WAITING_TRAFFIC: handleWaitingTraffic(); break;
-        case RobotState::MOVE_TO_INTERSECTION: handleMoveToIntersection(); break;
         case RobotState::NAVIGATE_TO_FINISH: handleNavigateToFinish(); break;
         case RobotState::TASK_COMPLETE: handleTaskComplete(); break;
         case RobotState::ERROR: handleErrorState(); break;
     }
+    
+    last_execute_time = current_time;
 }
 
 // ========== 状态处理函数 ==========
@@ -109,6 +125,10 @@ void NavigationStateMachine::handleMoveToQRZone() {
         sendNavigationGoal("qr_zone");
         task_flags_.qr_goal_sent = true;
     }
+    
+    // 时间统计
+    double time_in_state = (ros::Time::now() - state_start_time_).toSec();
+    ROS_INFO_THROTTLE(5, "[MOVE_TO_QR_ZONE] 已耗时: %.1f 秒", time_in_state);
 }
 
 void NavigationStateMachine::handleWaitingQRService() {
@@ -123,7 +143,8 @@ void NavigationStateMachine::handleWaitingQRService() {
             ros::Duration(0.5).sleep();
         }
     } else {
-        ROS_INFO_THROTTLE(5, "[WAITING_QR_SERVICE] 等待二维码识别结果...");
+        double time_in_state = (ros::Time::now() - state_start_time_).toSec();
+        ROS_INFO_THROTTLE(2, "[WAITING_QR_SERVICE] 等待二维码识别结果... 已耗时: %.1f 秒", time_in_state);
     }
 }
 
@@ -134,6 +155,10 @@ void NavigationStateMachine::handleMoveToPickZone() {
         sendNavigationGoal("pick_zone");
         task_flags_.pick_goal_sent = true;
     }
+    
+    // 时间统计
+    double time_in_state = (ros::Time::now() - state_start_time_).toSec();
+    ROS_INFO_THROTTLE(5, "[MOVE_TO_PICK_ZONE] 已耗时: %.1f 秒", time_in_state);
 }
 
 void NavigationStateMachine::handleScanningBoards() {
@@ -162,6 +187,11 @@ void NavigationStateMachine::handleScanningBoards() {
         first_enter = false;
         return;
     }
+    
+    // 时间统计
+    double time_in_state = (ros::Time::now() - state_start_time_).toSec();
+    double scan_time = (ros::Time::now() - scan_start_time_).toSec();
+    ROS_INFO_THROTTLE(2, "[SCANNING_BOARDS] 状态耗时: %.1f 秒, 扫描耗时: %.1f 秒", time_in_state, scan_time);
     
     if (rotation_optimization_active_ && object_detected_during_scan_) {
         ROS_INFO("旋转过程中检测到目标物体，立即停止旋转");
@@ -222,7 +252,8 @@ void NavigationStateMachine::handleScanningBoards() {
             rotated_angle = 2 * M_PI - rotated_angle;
         }
         
-        ROS_INFO_THROTTLE(1, "旋转优化: %.1f°/180°", rotated_angle * 180 / M_PI);
+        double rotation_time = (ros::Time::now() - rotation_start_time_).toSec();
+        ROS_INFO_THROTTLE(1, "旋转优化: %.1f°/180°, 旋转耗时: %.1f 秒", rotated_angle * 180 / M_PI, rotation_time);
         
         bool should_stop = false;
         std::string stop_reason;
@@ -230,7 +261,7 @@ void NavigationStateMachine::handleScanningBoards() {
         if (rotated_angle >= M_PI) {
             should_stop = true;
             stop_reason = "旋转角度达到目标";
-        } else if ((ros::Time::now() - rotation_start_time_).toSec() > 12.0) {
+        } else if (rotation_time > 12.0) {
             should_stop = true;
             stop_reason = "旋转超时";
         }
@@ -262,8 +293,8 @@ void NavigationStateMachine::handleScanningBoards() {
     if (!clusters_detected_ || detected_clusters_.empty()) {
         ROS_INFO_THROTTLE(2, "等待识别板检测...");
         
-        if ((ros::Time::now() - scan_start_time_).toSec() > LASER_SCAN_TIMEOUT) {
-            ROS_WARN("扫描总超时，未检测到识别板");
+        if (scan_time > LASER_SCAN_TIMEOUT) {
+            ROS_WARN("扫描总超时，未检测到识别板，扫描耗时: %.1f 秒", scan_time);
             speak("未找到识别板，继续执行");
             setState(RobotState::MOVE_TO_WAIT_ZONE);
             first_enter = true;
@@ -297,6 +328,13 @@ void NavigationStateMachine::handleNavigatingToBoard() {
         
         moving_to_cluster_ = true;
         task_flags_.navigation_in_progress = true;
+        cluster_nav_start_time_ = ros::Time::now();
+    }
+    
+    // 时间统计
+    if (moving_to_cluster_) {
+        double nav_time = (ros::Time::now() - cluster_nav_start_time_).toSec();
+        ROS_INFO_THROTTLE(2, "[NAVIGATING_TO_BOARD] 导航耗时: %.1f 秒", nav_time);
     }
 }
 
@@ -340,6 +378,11 @@ void NavigationStateMachine::handleWaitingVisual() {
         last_detected_object = "";
         return;
     }
+    
+    // 时间统计
+    double time_in_state = (ros::Time::now() - state_start_time_).toSec();
+    double wait_time = (ros::Time::now() - wait_start_time).toSec();
+    ROS_INFO_THROTTLE(2, "[WAITING_VISUAL] 状态耗时: %.1f 秒, 视觉等待: %.1f 秒", time_in_state, wait_time);
     
     if (!initial_delay_passed) {
         if (ros::Time::now() < detection_start_time) {
@@ -399,8 +442,8 @@ void NavigationStateMachine::handleWaitingVisual() {
         return;
     }
     
-    if ((ros::Time::now() - wait_start_time).toSec() > VISUAL_RECOGNITION_TIMEOUT) {
-        ROS_WARN("视觉识别超时，前往下一个识别板");
+    if (wait_time > VISUAL_RECOGNITION_TIMEOUT) {
+        ROS_WARN("视觉识别超时，耗时: %.1f 秒，前往下一个识别板", wait_time);
         moveToNextCluster();
         first_entered = true;
     }
@@ -428,17 +471,35 @@ void NavigationStateMachine::handleMoveToWaitZone() {
         sendNavigationGoal("wait_zone");
         task_flags_.wait_goal_sent = true;
     }
-    ROS_INFO_THROTTLE(2, "[MOVE_TO_WAIT_ZONE] 等待导航完成...");
+    
+    // 时间统计
+    double time_in_state = (ros::Time::now() - state_start_time_).toSec();
+    ROS_INFO_THROTTLE(2, "[MOVE_TO_WAIT_ZONE] 等待导航完成... 已耗时: %.1f 秒", time_in_state);
 }
 
 void NavigationStateMachine::handleWaitingSimulation() {
+    static ros::Time wait_start_time = ros::Time::now();
+    
+    // 时间统计
+    double wait_time = (ros::Time::now() - wait_start_time).toSec();
+    ROS_INFO_THROTTLE(2, "[WAITING_SIMULATION] 等待仿真结果... 已等待: %.1f 秒", wait_time);
+    
     if (task_flags_.simulation_received) {
         ROS_INFO("[WAITING_SIMULATION] 收到仿真结果: %s", simulation_result_.c_str());
         speak("仿真任务已完成，目标货物位于" + simulation_result_ + "房间");
         task_flags_.simulation_received = false;
         setState(RobotState::MOVE_TO_TRAFFIC_ZONE);
+        wait_start_time = ros::Time::now(); // 重置计时器
     } else {
-        ROS_INFO_THROTTLE(5, "[WAITING_SIMULATION] 等待仿真任务完成...");
+        // 开发调试模式：如果等待超过5秒，使用模拟数据继续
+        if (wait_time > 5.0) {
+            ROS_WARN("[WAITING_SIMULATION] 仿真结果未收到，等待 %.1f 秒后使用模拟数据继续测试", wait_time);
+            simulation_result_ = "A101"; // 模拟结果
+            speak("仿真任务已完成，目标货物位于" + simulation_result_ + "房间");
+            setState(RobotState::MOVE_TO_TRAFFIC_ZONE);
+            wait_start_time = ros::Time::now(); // 重置计时器
+            return;
+        }
     }
 }
 
@@ -449,62 +510,97 @@ void NavigationStateMachine::handleMoveToTrafficZone() {
         sendNavigationGoal("traffic_zone");
         task_flags_.traffic_goal_sent = true;
     }
-    ROS_INFO_THROTTLE(2, "[MOVE_TO_TRAFFIC_ZONE] 等待导航完成...");
+    
+    // 时间统计
+    double time_in_state = (ros::Time::now() - state_start_time_).toSec();
+    ROS_INFO_THROTTLE(2, "[MOVE_TO_TRAFFIC_ZONE] 等待导航完成... 已耗时: %.1f 秒", time_in_state);
 }
 
 void NavigationStateMachine::handleWaitingTraffic() {
-    if (task_flags_.traffic_received) {
-        ROS_INFO("[WAITING_TRAFFIC] 收到路牌识别结果: %s", traffic_result_.c_str());
-        speak("路口" + traffic_result_ + "可通过");
-        task_flags_.traffic_received = false;
-        setState(RobotState::MOVE_TO_INTERSECTION);
-    } else {
-        ROS_INFO_THROTTLE(5, "[WAITING_TRAFFIC] 等待路牌识别结果...");
+    static ros::Time traffic_wait_start_time;
+    static bool first_enter = true;
+    static bool initial_delay_passed = false;
+    
+    if (first_enter) {
+        ROS_INFO("[WAITING_TRAFFIC] 开始等待交通灯识别，初始延迟0.5秒");
+        traffic_wait_start_time = ros::Time::now();
+        first_enter = false;
+        initial_delay_passed = false;
+        return;
     }
+    
+    // 时间统计
+    double time_in_state = (ros::Time::now() - state_start_time_).toSec();
+    double wait_time = (ros::Time::now() - traffic_wait_start_time).toSec();
+    
+    // 初始延迟：至少等待0.5秒才开始处理识别结果
+    if (!initial_delay_passed) {
+        if (wait_time < 0.5) {
+            ROS_INFO_THROTTLE(1, "[WAITING_TRAFFIC] 初始延迟中... %.1f/0.5秒", wait_time);
+            return;
+        } else {
+            ROS_INFO("[WAITING_TRAFFIC] 初始延迟结束，开始处理交通灯识别结果");
+            initial_delay_passed = true;
+        }
+    }
+    
+    ROS_INFO_THROTTLE(2, "[WAITING_TRAFFIC] 等待路牌识别结果... 已等待: %.1f 秒", wait_time);
+    
+    if (task_flags_.traffic_received) {
+        // 只处理有效的识别结果（A或B），忽略"unknown"
+        if (traffic_result_ == "A" || traffic_result_ == "B") {
+            ROS_INFO("[WAITING_TRAFFIC] 收到有效路牌识别结果: %s", traffic_result_.c_str());
+            speak("路口" + traffic_result_ + "可通过");
+            task_flags_.traffic_received = false;
+            first_enter = true;  // 重置状态
+            initial_delay_passed = false;
+            setState(RobotState::NAVIGATE_TO_FINISH);
+        } else {
+            ROS_WARN_THROTTLE(1, "[WAITING_TRAFFIC] 忽略无效识别结果: %s，继续等待...", traffic_result_.c_str());
+            // 不清除traffic_received标志，等待下一个有效结果
+        }
+    }
+    
 }
 
-void NavigationStateMachine::handleMoveToIntersection() {
-    if (!task_flags_.intersection_goal_sent_flag) {
-        ROS_INFO("[MOVE_TO_INTERSECTION] 前往可通过的路口");
+void NavigationStateMachine::handleNavigateToFinish() {
+    if (!task_flags_.finish_goal_sent) {
+        ROS_INFO("[NAVIGATE_TO_FINISH] 使用中继点序列前往终点");
         
-        std::string intersection_point;
+        // 设置中继点序列
+        waypoint_sequence_.clear();
+        current_waypoint_index_ = 0;
+        
         if (traffic_result_ == "A") {
-            intersection_point = "intersection_A";
-            ROS_INFO("A路口可通过，前往A路口入口");
+            // A路口可通过 -> 使用A路口作为中继点前往终点B
+            waypoint_sequence_ = {"intersection_A", "finish_zone_B"};
+            ROS_INFO("A路口可通过，使用B路口作为中继点前往终点B");
         } else if (traffic_result_ == "B") {
-            intersection_point = "intersection_B";
-            ROS_INFO("B路口可通过，前往B路口入口");
+            // B路口可通过 -> 使用B路口作为中继点前往终点A
+            waypoint_sequence_ = {"intersection_B", "finish_zone_A"};
+            ROS_INFO("B路口可通过，使用A路口作为中继点前往终点A");
         } else {
             ROS_ERROR("未知的路口识别结果: %s", traffic_result_.c_str());
             setState(RobotState::ERROR);
             return;
         }
         
-        speak("正在前往可通过的路口");
-        sendNavigationGoal(intersection_point);
-        task_flags_.intersection_goal_sent_flag = true;
-    }
-    ROS_INFO_THROTTLE(2, "[MOVE_TO_INTERSECTION] 等待导航完成...");
-}
-
-void NavigationStateMachine::handleNavigateToFinish() {
-    if (!task_flags_.finish_goal_sent) {
-        ROS_INFO("[NAVIGATE_TO_FINISH] 从路口巡线前往终点");
+        speak("正在使用中继点导航前往终点");
         
-        std::string finish_point;
-        if (traffic_result_ == "A") {
-            finish_point = "finish_zone_B";
-            ROS_INFO("从A路口巡线前往右下方终点B");
-        } else if (traffic_result_ == "B") {
-            finish_point = "finish_zone_A";
-            ROS_INFO("从B路口巡线前往左下方终点A");
-        }
-        
-        speak("正在巡线前往终点");
-        sendNavigationGoal(finish_point);
+        // 开始第一个中继点
+        sendNavigationGoal(waypoint_sequence_[0]);
+        following_waypoint_sequence_ = true;
         task_flags_.finish_goal_sent = true;
+        
+        ROS_INFO("开始中继点序列，共 %zu 个点", waypoint_sequence_.size());
+        for (size_t i = 0; i < waypoint_sequence_.size(); ++i) {
+            ROS_INFO("  中继点[%zu]: %s", i, waypoint_sequence_[i].c_str());
+        }
     }
-    ROS_INFO_THROTTLE(2, "[NAVIGATE_TO_FINISH] 等待导航完成...");
+    
+    // 时间统计
+    double time_in_state = (ros::Time::now() - state_start_time_).toSec();
+    ROS_INFO_THROTTLE(2, "[NAVIGATE_TO_FINISH] 中继点导航中... 已耗时: %.1f 秒", time_in_state);
 }
 
 void NavigationStateMachine::handleTaskComplete() {
@@ -513,6 +609,13 @@ void NavigationStateMachine::handleTaskComplete() {
     if (!task_complete_announced) {
         ROS_INFO("[TASK_COMPLETE] 任务完成");
         speak("我已完成货物采购任务，本次采购货物为" + picked_object_ + "，总计花费15元，需找零5元");
+        
+        // 延迟一下再输出时间统计，确保所有状态时间都记录完成
+        ros::Duration(1.0).sleep();
+        
+        // 输出总时间统计
+        printTimeStatistics();
+        
         ROS_INFO("=== 演示任务完成 ===");
         task_complete_announced = true;
     }
@@ -521,7 +624,8 @@ void NavigationStateMachine::handleTaskComplete() {
 }
 
 void NavigationStateMachine::handleErrorState() {
-    ROS_ERROR("[ERROR] 进入错误状态，尝试恢复...");
+    double time_in_state = (ros::Time::now() - state_start_time_).toSec();
+    ROS_ERROR("[ERROR] 进入错误状态，已持续: %.1f 秒，尝试恢复...", time_in_state);
     speak("导航出现问题，尝试恢复");
     
     action_client_.cancelAllGoals();
@@ -536,6 +640,55 @@ void NavigationStateMachine::handleErrorState() {
     }
     
     ros::Duration(1.0).sleep();
+}
+
+// ========== 时间统计函数 ==========
+
+void NavigationStateMachine::recordStateDuration(RobotState state, double duration) {
+    state_durations_[static_cast<int>(state)] = duration;
+}
+
+void NavigationStateMachine::printTimeStatistics() {
+    ROS_INFO("========== 导航状态时间统计 ==========");
+    double total_time = 0.0;
+    
+    // 添加当前状态的持续时间
+    ros::Time current_time = ros::Time::now();
+    double current_state_duration = (current_time - state_start_time_).toSec();
+    recordStateDuration(current_state_, current_state_duration);
+    
+    for (const auto& entry : state_durations_) {
+        RobotState state = static_cast<RobotState>(entry.first);
+        double duration = entry.second;
+        total_time += duration;
+        
+        const char* state_name = getStateName(state);
+        ROS_INFO("状态 %d (%s): %.1f 秒", entry.first, state_name, duration);
+    }
+    
+    ROS_INFO("总执行时间: %.1f 秒 (约 %.1f 分钟)", total_time, total_time / 60.0);
+    ROS_INFO("======================================");
+}
+
+const char* NavigationStateMachine::getStateName(RobotState state) {
+    switch(state) {
+        case RobotState::INIT: return "INIT";
+        case RobotState::MOVE_TO_QR_ZONE: return "MOVE_TO_QR_ZONE";
+        case RobotState::WAITING_QR_SERVICE: return "WAITING_QR_SERVICE";
+        case RobotState::MOVE_TO_PICK_ZONE: return "MOVE_TO_PICK_ZONE";
+        case RobotState::SCANNING_BOARDS: return "SCANNING_BOARDS";
+        case RobotState::NAVIGATING_TO_BOARD: return "NAVIGATING_TO_BOARD";
+        case RobotState::WAITING_VISUAL: return "WAITING_VISUAL";
+        case RobotState::OBJECT_CONFIRMED: return "OBJECT_CONFIRMED";
+        case RobotState::MOVE_TO_WAIT_ZONE: return "MOVE_TO_WAIT_ZONE";
+        case RobotState::WAITING_SIMULATION: return "WAITING_SIMULATION";
+        case RobotState::MOVE_TO_TRAFFIC_ZONE: return "MOVE_TO_TRAFFIC_ZONE";
+        case RobotState::WAITING_TRAFFIC: return "WAITING_TRAFFIC";
+        case RobotState::NAVIGATE_TO_FINISH: return "NAVIGATE_TO_FINISH";
+        case RobotState::TASK_COMPLETE: return "TASK_COMPLETE";
+        case RobotState::ERROR: return "ERROR";
+        default: return "UNKNOWN";
+    }
 }
 
 // ========== 激光雷达相关函数 ==========
@@ -1160,9 +1313,15 @@ void NavigationStateMachine::simulationCallback(const std_msgs::String::ConstPtr
 }
 
 void NavigationStateMachine::trafficCallback(const std_msgs::String::ConstPtr& msg) {
-    traffic_result_ = msg->data;
-    task_flags_.traffic_received = true;
-    ROS_INFO("收到路牌识别结果: %s", traffic_result_.c_str());
+    // 在等待交通灯状态时持续更新结果（不只是第一次）
+    if (current_state_ == RobotState::WAITING_TRAFFIC) {
+        traffic_result_ = msg->data;
+        task_flags_.traffic_received = true;
+        ROS_INFO("收到路牌识别结果: %s", traffic_result_.c_str());
+    } else {
+        ROS_DEBUG_THROTTLE(5, "忽略路牌识别结果[状态%d]: %s", 
+                          static_cast<int>(current_state_), msg->data.c_str());
+    }
 }
 
 // ========== ActionLib回调函数 ==========
@@ -1179,7 +1338,6 @@ void NavigationStateMachine::navDoneCallback(const actionlib::SimpleClientGoalSt
         current_state_ != RobotState::MOVE_TO_PICK_ZONE &&
         current_state_ != RobotState::MOVE_TO_WAIT_ZONE &&
         current_state_ != RobotState::MOVE_TO_TRAFFIC_ZONE &&
-        current_state_ != RobotState::MOVE_TO_INTERSECTION &&
         current_state_ != RobotState::NAVIGATE_TO_FINISH &&
         current_state_ != RobotState::NAVIGATING_TO_BOARD) {
         ROS_INFO("忽略导航回调，当前状态 %d 不是导航状态", static_cast<int>(current_state_));
@@ -1202,16 +1360,20 @@ void NavigationStateMachine::navDoneCallback(const actionlib::SimpleClientGoalSt
             case RobotState::MOVE_TO_TRAFFIC_ZONE:
                 setState(RobotState::WAITING_TRAFFIC);
                 break;
-            case RobotState::MOVE_TO_INTERSECTION:
-                setState(RobotState::NAVIGATE_TO_FINISH);
-                break;
             case RobotState::NAVIGATE_TO_FINISH:
-                setState(RobotState::TASK_COMPLETE);
+                // 中继点导航完成，检查是否到达终点
+                if (following_waypoint_sequence_) {
+                    // 如果还在中继点序列中，不应该走到这里
+                    ROS_WARN("中继点导航异常完成，检查中继点切换逻辑");
+                } else {
+                    // 正常到达终点
+                    setState(RobotState::TASK_COMPLETE);
+                }
                 break;
             case RobotState::NAVIGATING_TO_BOARD:
                 // 正常情况下，NAVIGATING_TO_BOARD 应该由智能停止处理
-                // 如果走到这里，说明智能停止没触发，直接进入视觉状态
-                ROS_WARN("NAVIGATING_TO_BOARD 导航完成，但智能停止未触发");
+                // 如果走到这里，说明智能停止没触发，使用move_base的结果
+                ROS_WARN("NAVIGATING_TO_BOARD 导航完成，但智能停止未触发，使用move_base结果");
                 moving_to_cluster_ = false;
                 setState(RobotState::WAITING_VISUAL);
                 break;
@@ -1231,6 +1393,12 @@ void NavigationStateMachine::navDoneCallback(const actionlib::SimpleClientGoalSt
                 // 状态已经由智能停止设置了，不需要重复设置
                 return;
             }
+            
+            // 如果是中继点切换取消，也是正常行为
+            if (following_waypoint_sequence_) {
+                ROS_INFO("中继点切换取消，正常行为");
+                return;
+            }
         }
         
         ROS_ERROR("导航目标失败: %s - %s", 
@@ -1242,6 +1410,7 @@ void NavigationStateMachine::navDoneCallback(const actionlib::SimpleClientGoalSt
             ROS_WARN("识别板导航真正失败，尝试下一个");
             moveToNextCluster();
         } else {
+            // 其他固定导航点失败进入错误状态
             setState(RobotState::ERROR);
         }
     }
@@ -1251,29 +1420,21 @@ void NavigationStateMachine::navActiveCallback() {
     ROS_INFO("导航目标已激活: %s", current_goal_point_.c_str());
 }
 
-// ========== 智能停止核心函数 ==========
+// ========== 智能停止和中继点切换核心函数 ==========
 
 void NavigationStateMachine::navFeedbackCallback(const move_base_msgs::MoveBaseFeedbackConstPtr& feedback) {
     ROS_INFO_THROTTLE(5, "导航反馈 - 当前位置: (%.2f, %.2f)", 
                      feedback->base_position.pose.position.x,
                      feedback->base_position.pose.position.y);
     
-    // === 智能停止：针对所有固定导航点和识别板导航 ===
-    switch(current_state_) {
-        case RobotState::NAVIGATING_TO_BOARD:
-            handleBoardNavigationStop(feedback);
-            break;
-        case RobotState::MOVE_TO_QR_ZONE:
-        case RobotState::MOVE_TO_PICK_ZONE:
-        case RobotState::MOVE_TO_WAIT_ZONE:
-        case RobotState::MOVE_TO_TRAFFIC_ZONE:
-        case RobotState::MOVE_TO_INTERSECTION:
-        case RobotState::NAVIGATE_TO_FINISH:
-            handleFixedPointNavigationStop(feedback);
-            break;
-        default:
-            // 其他状态不需要智能停止
-            break;
+    // === 智能停止：只在识别板导航时工作 ===
+    if (current_state_ == RobotState::NAVIGATING_TO_BOARD) {
+        handleBoardNavigationStop(feedback);
+    }
+    
+    // === 中继点智能切换 ===
+    if (following_waypoint_sequence_ && !waypoint_sequence_.empty()) {
+        handleWaypointSwitching(feedback);
     }
 }
 
@@ -1310,63 +1471,53 @@ void NavigationStateMachine::handleBoardNavigationStop(const move_base_msgs::Mov
     }
 }
 
-void NavigationStateMachine::handleFixedPointNavigationStop(const move_base_msgs::MoveBaseFeedbackConstPtr& feedback) {
-    auto it = navigation_points_.find(current_goal_point_);
+void NavigationStateMachine::handleWaypointSwitching(const move_base_msgs::MoveBaseFeedbackConstPtr& feedback) {
+    if (current_waypoint_index_ >= waypoint_sequence_.size()) {
+        return;
+    }
+    
+    // 获取当前目标点
+    std::string current_target = waypoint_sequence_[current_waypoint_index_];
+    auto it = navigation_points_.find(current_target);
     if (it == navigation_points_.end()) {
         return;
     }
     
     geometry_msgs::Pose target_pose = it->second.pose;
     
-    // 计算距离
+    // 计算距离（使用您智能停止的相同逻辑）
     float dx = feedback->base_position.pose.position.x - target_pose.position.x;
     float dy = feedback->base_position.pose.position.y - target_pose.position.y;
     float distance = sqrt(dx*dx + dy*dy);
     
-    // 计算角度差
-    float target_yaw = getYawFromPose(target_pose);
-    float current_yaw = getYawFromPose(feedback->base_position.pose);
-    float yaw_diff = fabs(current_yaw - target_yaw);
-    if (yaw_diff > M_PI) yaw_diff = 2 * M_PI - yaw_diff;
+    ROS_DEBUG_THROTTLE(2, "距离中继点[%s]: %.2fm", current_target.c_str(), distance);
     
-    // 根据目标类型设置不同的停止阈值
-    float distance_threshold = 0.15f;
-    float yaw_threshold = 0.3f;
-    
-    // 终点区域使用更严格的阈值
-    if (current_goal_point_.find("finish_zone") != std::string::npos) {
-        distance_threshold = 0.12f;
-        yaw_threshold = 0.25f;
-    }
-    
-    // 检查是否满足容差
-    if (distance <= distance_threshold && yaw_diff <= yaw_threshold) {
-        ROS_INFO("到达 %s 位置！主动停止导航 (距离: %.3fm, 角度差: %.1f°)", 
-                 current_goal_point_.c_str(), distance, yaw_diff * 180 / M_PI);
-        action_client_.cancelAllGoals();
-        stopMoving();
+    // 检查是否达到切换距离
+    if (distance <= waypoint_switch_distance_) {
+        ROS_INFO("到达中继点 %s 附近，切换到下一个目标", current_target.c_str());
         
-        // 状态切换
-        task_flags_.navigation_in_progress = false;
-        triggerStateTransition(current_goal_point_);
-    }
-}
-
-void NavigationStateMachine::triggerStateTransition(const std::string& goal_name) {
-    if (goal_name == "qr_zone") {
-        setState(RobotState::WAITING_QR_SERVICE);
-    } else if (goal_name == "pick_zone") {
-        setState(RobotState::SCANNING_BOARDS);
-    } else if (goal_name == "wait_zone") {
-        setState(RobotState::WAITING_SIMULATION);
-    } else if (goal_name == "traffic_zone") {
-        setState(RobotState::WAITING_TRAFFIC);
-    } else if (goal_name == "intersection_A" || goal_name == "intersection_B") {
-        setState(RobotState::NAVIGATE_TO_FINISH);
-    } else if (goal_name == "finish_zone_A" || goal_name == "finish_zone_B") {
-        setState(RobotState::TASK_COMPLETE);
-    } else {
-        ROS_WARN("未知的目标点 %s，无法触发状态转换", goal_name.c_str());
+        // 取消当前导航目标
+        action_client_.cancelAllGoals();
+        
+        // 切换到下一个中继点
+        current_waypoint_index_++;
+        
+        if (current_waypoint_index_ < waypoint_sequence_.size()) {
+            // 还有下一个中继点，立即发布新目标
+            std::string next_target = waypoint_sequence_[current_waypoint_index_];
+            ROS_INFO("切换到下一个中继点: %s", next_target.c_str());
+            
+            // 立即发送新目标，不停止
+            sendNavigationGoal(next_target);
+        } else {
+            // 序列完成
+            ROS_INFO("中继点序列完成，到达最终目标");
+            following_waypoint_sequence_ = false;
+            task_flags_.navigation_in_progress = false;
+            
+            // 触发任务完成状态
+            setState(RobotState::TASK_COMPLETE);
+        }
     }
 }
 
@@ -1417,7 +1568,14 @@ void NavigationStateMachine::sendNavigationGoal(const std::string& point_name) {
     }
 }
 
+// ========== 修改setState函数以记录时间 ==========
+
 void NavigationStateMachine::setState(RobotState new_state) {
+    // 记录当前状态的持续时间
+    ros::Time current_time = ros::Time::now();
+    double duration = (current_time - state_start_time_).toSec();
+    recordStateDuration(current_state_, duration);
+    
     // 在关键状态转换时验证TF数据
     if (new_state == RobotState::SCANNING_BOARDS || 
         new_state == RobotState::NAVIGATING_TO_BOARD) {
@@ -1434,10 +1592,11 @@ void NavigationStateMachine::setState(RobotState new_state) {
         clusters_calculated_ = false;
     }
 
-    ROS_INFO("状态转换: %d -> %d", 
-             static_cast<int>(current_state_), 
-             static_cast<int>(new_state));
+    ROS_INFO("状态转换: %s (%.1f 秒) -> %s", 
+             getStateName(current_state_), duration, getStateName(new_state));
+    
     current_state_ = new_state;
+    state_start_time_ = current_time;
 }
 
 void NavigationStateMachine::loadNavigationPoints() {
@@ -1449,11 +1608,6 @@ void NavigationStateMachine::loadNavigationPoints() {
     navigation_points_["intersection_B"] = createPose(7.3, 4.6, -1.57);
     navigation_points_["finish_zone_A"] = createPose(4.9, 0.4, -1.57);
     navigation_points_["finish_zone_B"] = createPose(6.5, 0.4, -1.57);
-
-    // 测试用
-    navigation_points_["room_A"] = createPose(0.7, 5.5, 3.14);
-    navigation_points_["room_B"] = createPose(1.6, 6.3, 1.57);
-    navigation_points_["room_C"] = createPose(2.6, 5.5, 0.0);
 
     ROS_INFO("加载了 %zu 个导航点", navigation_points_.size());
 }
