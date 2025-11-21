@@ -49,8 +49,7 @@ enum class RobotState {
     // 最终导航阶段
     MOVE_TO_TRAFFIC_ZONE,   // 移动到路牌识别区域
     WAITING_TRAFFIC,        // 等待路牌识别结果
-    MOVE_TO_INTERSECTION,   // 前往可通过的路口
-    NAVIGATE_TO_FINISH,     // 导航到终点区域
+    NAVIGATE_TO_FINISH,     // 导航到终点区域（使用中继点）
     
     // 完成与错误状态
     TASK_COMPLETE,          // 任务完成
@@ -85,7 +84,6 @@ public:
         bool pick_goal_sent = false;               // 拣货区目标是否已发送
         bool wait_goal_sent = false;               // 等待区目标是否已发送
         bool traffic_goal_sent = false;            // 路牌识别区目标是否已发送
-        bool intersection_goal_sent_flag = false;  // 路口目标是否已发送
         bool finish_goal_sent = false;             // 终点目标是否已发送
         bool object_picked = false;                // 物体是否已确认拾取
         bool simulation_received = false;          // 仿真结果是否已接收
@@ -156,7 +154,7 @@ private:
     std::string current_goal_point_;          // 当前导航目标点名称
     double total_cost_ = 0.0;                 // 任务总花费
     
-    // 物体检测相关
+    // 新增：物体检测相关
     bool object_detected_during_scan_ = false;  // 扫描过程中是否检测到目标物体
     std::string detected_object_name_;          // 检测到的物体名称
     
@@ -190,6 +188,12 @@ private:
     float scan_robot_y_ = 0.0f;     // 扫描时机器人Y坐标（全局）
     float scan_robot_yaw_ = 0.0f;   // 扫描时机器人朝向角（全局，rad）
 
+    // ========== 中继点导航相关 ==========
+    std::vector<std::string> waypoint_sequence_;           // 中继点序列
+    int current_waypoint_index_ = 0;                       // 当前中继点索引
+    bool following_waypoint_sequence_ = false;             // 是否正在跟随中继点序列
+    float waypoint_switch_distance_ = 0.8f;                // 中继点切换距离（m）
+
     // ========== 私有方法声明 ==========
     
     // 状态处理函数（按状态枚举顺序排列）
@@ -205,7 +209,6 @@ private:
     void handleWaitingSimulation();
     void handleMoveToTrafficZone();
     void handleWaitingTraffic();
-    void handleMoveToIntersection();
     void handleNavigateToFinish();
     void handleTaskComplete();
     void handleErrorState();
@@ -231,10 +234,9 @@ private:
     void navFeedbackCallback(const move_base_msgs::MoveBaseFeedbackConstPtr& feedback);
     void clusterArrivedCallback(const actionlib::SimpleClientGoalState& state, const move_base_msgs::MoveBaseResultConstPtr& result);
 
-    // 智能停止核心函数（新增）
+    // 智能停止核心函数
     void handleBoardNavigationStop(const move_base_msgs::MoveBaseFeedbackConstPtr& feedback);
-    void handleFixedPointNavigationStop(const move_base_msgs::MoveBaseFeedbackConstPtr& feedback);
-    void triggerStateTransition(const std::string& goal_name);
+    void handleWaypointSwitching(const move_base_msgs::MoveBaseFeedbackConstPtr& feedback);  // 新增：中继点切换处理
     float getYawFromPose(const geometry_msgs::Pose& pose);
 
     // 服务调用
@@ -260,6 +262,16 @@ private:
     void objectDetectedCallback(const std_msgs::String::ConstPtr& msg);  // 物体检测回调
     void simulationCallback(const std_msgs::String::ConstPtr& msg);
     void trafficCallback(const std_msgs::String::ConstPtr& msg);
+
+    // 时间统计相关
+    ros::Time state_start_time_;
+    std::map<int, double> state_durations_; // 状态编号 -> 持续时间
+    ros::Time cluster_nav_start_time_;
+    
+    // 时间统计函数
+    void recordStateDuration(RobotState state, double duration);
+    void printTimeStatistics();
+    const char* getStateName(RobotState state);
 };
 
 #endif  // NAVIGATION_STATE_MACHINE_H
