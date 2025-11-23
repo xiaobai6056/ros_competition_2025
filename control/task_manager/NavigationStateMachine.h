@@ -24,6 +24,21 @@
 #include <string>
 #include <vector>
 #include <cmath>
+#include <sstream>
+
+/**
+ * @brief PCA结果结构体
+ * 存储主成分分析的计算结果
+ */
+struct PCAResult {
+    float length;           // 板子长度（第一主成分方向）
+    float orientation;      // 板子朝向（弧度）
+    float confidence;       // 置信度（第一特征值占比）
+    geometry_msgs::Point start_point;  // 投影起点
+    geometry_msgs::Point end_point;    // 投影终点
+    
+    PCAResult() : length(0.0f), orientation(0.0f), confidence(0.0f) {}
+};
 
 /**
  * @brief 机器人导航状态枚举
@@ -37,7 +52,12 @@ enum class RobotState {
     
     // 物体识别阶段
     MOVE_TO_PICK_ZONE,      // 移动到拣货区域
-    SCANNING_BOARDS,        // 扫描识别板（激光雷达聚类）
+    
+    // 三状态PCA检测
+    ROTATION_SCAN,          // 旋转扫描收集数据
+    PCA_CALCULATION,        // PCA计算处理
+    CLUSTER_SELECTION,      // 簇选择与决策
+    
     NAVIGATING_TO_BOARD,    // 导航到目标识别板
     WAITING_VISUAL,         // 等待视觉识别结果
     OBJECT_CONFIRMED,       // 物体识别确认完成
@@ -72,6 +92,9 @@ public:
         size_t size;                       // 聚类包含的激光点数量
         float angular_width;               // 聚类的角度跨度（rad）
         float board_yaw;                   // 识别板的朝向角（rad，全局坐标系）
+        float length;                      // PCA计算的长度（m）
+        float pca_confidence;              // PCA置信度
+        std::string debug_info;            // 调试信息
     };
 
     /**
@@ -105,16 +128,11 @@ public:
 private:
     // ========== 常量定义（集中管理魔法数字） ==========
     static constexpr float TARGET_OBSTACLE_DISTANCE = 0.5f;  // 障碍物检测阈值（m）
-    static constexpr float DEFAULT_SAFE_DISTANCE = 0.4f;     // 默认安全距离（m）
+    static constexpr float DEFAULT_SAFE_DISTANCE = 0.6f;     // 默认安全距离（m）
     static constexpr float EXTENDED_SAFE_DISTANCE = 0.8f;    // 扩展安全距离（m，用于不可达区域）
     static constexpr int LASER_SCAN_TIMEOUT = 5;             // 激光扫描超时时间（s）
     static constexpr int VISUAL_RECOGNITION_TIMEOUT = 15;    // 视觉识别超时时间（s）
     static constexpr int SERVICE_RETRY_COUNT = 3;            // 服务调用重试次数
-
-     // === 旋转优化控制变量 ===
-    bool rotation_optimization_active_ = false;
-    float rotation_start_yaw_ = 0.0f;
-    ros::Time rotation_start_time_;
 
     // ========== ROS 通信成员 ==========
     ros::NodeHandle nh_;                                      // 节点句柄
@@ -194,6 +212,14 @@ private:
     bool following_waypoint_sequence_ = false;             // 是否正在跟随中继点序列
     float waypoint_switch_distance_ = 0.8f;                // 中继点切换距离（m）
 
+    // ========== 三状态PCA检测相关 ==========
+    bool rotation_scan_complete_ = false;                  // 旋转扫描是否完成
+    bool pca_calculation_complete_ = false;                // PCA计算是否完成
+    std::vector<sensor_msgs::LaserScan> cached_laser_scans_; // 缓存的激光数据
+    size_t max_cached_scans_ = 5;                          // 最大缓存帧数
+    float rotation_target_angle_ = M_PI;                   // 旋转目标角度（180度）
+    float current_rotated_angle_ = 0.0f;                   // 当前已旋转角度
+
     // ========== 私有方法声明 ==========
     
     // 状态处理函数（按状态枚举顺序排列）
@@ -201,7 +227,12 @@ private:
     void handleMoveToQRZone();
     void handleWaitingQRService();
     void handleMoveToPickZone();
-    void handleScanningBoards();
+    
+    // 三状态PCA检测
+    void handleRotationScan();
+    void handlePCACalculation();
+    void handleClusterSelection();
+    
     void handleNavigatingToBoard();
     void handleWaitingVisual();
     void handleObjectConfirmed();
@@ -217,12 +248,16 @@ private:
     void laserCallback(const sensor_msgs::LaserScan::ConstPtr& msg);
     void detectObjectClusters(const sensor_msgs::LaserScan::ConstPtr& scan);
     ClusterInfo calculateClusterInfo(const std::vector<int>& cluster, const sensor_msgs::LaserScan::ConstPtr& scan);
-    bool isValidObjectCluster(const ClusterInfo& cluster_info, const std::vector<int>& cluster, const sensor_msgs::LaserScan::ConstPtr& scan);
+    bool isValidObjectCluster(const ClusterInfo& cluster_info, const std::vector<int>& cluster, 
+                             const sensor_msgs::LaserScan::ConstPtr& scan, std::string& debug_info);
     float calculateBoardLength(const std::vector<int>& cluster, const sensor_msgs::LaserScan::ConstPtr& scan);
     void selectBestCluster();
     void moveToNextCluster();
     geometry_msgs::Point calculateSafeTarget(const ClusterInfo& cluster_info);
     float calculateAdaptiveSafeDistance(const geometry_msgs::Point& target_point);  // 自适应安全距离计算
+
+    // PCA核心算法
+    PCAResult computePCA(const std::vector<int>& cluster, const sensor_msgs::LaserScan::ConstPtr& scan);
 
     // 导航与运动控制
     void sendNavigationGoal(const std::string& point_name);
@@ -236,7 +271,7 @@ private:
 
     // 智能停止核心函数
     void handleBoardNavigationStop(const move_base_msgs::MoveBaseFeedbackConstPtr& feedback);
-    void handleWaypointSwitching(const move_base_msgs::MoveBaseFeedbackConstPtr& feedback);  // 新增：中继点切换处理
+    void handleWaypointSwitching(const move_base_msgs::MoveBaseFeedbackConstPtr& feedback);
     float getYawFromPose(const geometry_msgs::Pose& pose);
 
     // 服务调用
