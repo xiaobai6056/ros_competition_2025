@@ -6,6 +6,7 @@
 #include <sstream>
 #include <std_srvs/Trigger.h>
 #include <std_msgs/String.h>
+#include <iomanip>
 
 // 常量定义（与头文件保持一致）
 constexpr float NavigationStateMachine::TARGET_OBSTACLE_DISTANCE;
@@ -14,6 +15,33 @@ constexpr float NavigationStateMachine::EXTENDED_SAFE_DISTANCE;
 constexpr int NavigationStateMachine::LASER_SCAN_TIMEOUT;
 constexpr int NavigationStateMachine::VISUAL_RECOGNITION_TIMEOUT;
 constexpr int NavigationStateMachine::SERVICE_RETRY_COUNT;
+
+// PCA检测参数
+struct PCAParams {
+    // 聚类参数
+    float max_distance_jump = 0.1f;
+    float min_valid_range = 0.1f;
+    float max_valid_range = 4.0f;
+    int min_cluster_size = 10;
+    int max_cluster_size = 100;
+    
+    // 过滤参数
+    float min_board_length = 0.4f;
+    float max_board_length = 0.6f;
+    float max_angular_width = 0.4f;
+    float duplicate_distance = 0.3f;
+    
+    // PCA参数
+    float min_pca_confidence = 0.6f;
+    float max_distance_std = 0.2f;
+    
+    // 地理约束参数
+    float valid_min_x = -0.20f;
+    float valid_max_x = 3.58f;
+    float valid_min_y = 2.94f;
+    float valid_max_y = 7.50f;
+} pca_params_;
+
 
 NavigationStateMachine::NavigationStateMachine(ros::NodeHandle& nh) 
     : nh_(nh), 
@@ -28,8 +56,6 @@ NavigationStateMachine::NavigationStateMachine(ros::NodeHandle& nh)
       scan_robot_x_(0.0f),
       scan_robot_y_(0.0f),
       scan_robot_yaw_(0.0f),
-      rotation_optimization_active_(false),
-      rotation_start_yaw_(0.0f),
       clusters_calculated_(false),
       object_detected_during_scan_(false),
       detected_object_name_(""),
@@ -41,7 +67,14 @@ NavigationStateMachine::NavigationStateMachine(ros::NodeHandle& nh)
       object_service_called_(false),
       current_waypoint_index_(0),
       following_waypoint_sequence_(false),
-      waypoint_switch_distance_(0.8f)
+      waypoint_switch_distance_(0.8f),
+      // 新增三状态相关变量
+      rotation_scan_complete_(false),
+      pca_calculation_complete_(false),
+      cached_laser_scans_(),
+      max_cached_scans_(5),
+      rotation_target_angle_(M_PI), // 180度
+      current_rotated_angle_(0.0f)
 {
     // 初始化状态时间统计
     state_start_time_ = ros::Time::now();
@@ -77,7 +110,7 @@ NavigationStateMachine::NavigationStateMachine(ros::NodeHandle& nh)
                                     &NavigationStateMachine::costmapCallback, this);
     costmap_updated_ = false;
 
-    ROS_INFO("导航状态机初始化完成 - 带中继点导航功能");
+    ROS_INFO("导航状态机初始化完成 - 三状态PCA识别板检测");
 }
 
 void NavigationStateMachine::execute() {
@@ -94,7 +127,12 @@ void NavigationStateMachine::execute() {
         case RobotState::MOVE_TO_QR_ZONE: handleMoveToQRZone(); break;
         case RobotState::WAITING_QR_SERVICE: handleWaitingQRService(); break;
         case RobotState::MOVE_TO_PICK_ZONE: handleMoveToPickZone(); break;
-        case RobotState::SCANNING_BOARDS: handleScanningBoards(); break;
+        
+        // 三状态PCA检测
+        case RobotState::ROTATION_SCAN: handleRotationScan(); break;
+        case RobotState::PCA_CALCULATION: handlePCACalculation(); break;
+        case RobotState::CLUSTER_SELECTION: handleClusterSelection(); break;
+        
         case RobotState::NAVIGATING_TO_BOARD: handleNavigatingToBoard(); break;
         case RobotState::WAITING_VISUAL: handleWaitingVisual(); break;
         case RobotState::OBJECT_CONFIRMED: handleObjectConfirmed(); break;
@@ -139,8 +177,8 @@ void NavigationStateMachine::handleWaitingQRService() {
             qr_service_called_ = true;
             service_call_time_ = ros::Time::now();
         } else {
-            ROS_WARN("二维码服务调用失败，0.5秒后重试");
-            ros::Duration(0.5).sleep();
+            ROS_WARN("二维码服务调用失败，0.1秒后重试");
+            ros::Duration(0.1).sleep();
         }
     } else {
         double time_in_state = (ros::Time::now() - state_start_time_).toSec();
@@ -161,144 +199,213 @@ void NavigationStateMachine::handleMoveToPickZone() {
     ROS_INFO_THROTTLE(5, "[MOVE_TO_PICK_ZONE] 已耗时: %.1f 秒", time_in_state);
 }
 
-void NavigationStateMachine::handleScanningBoards() {
-    static bool first_enter = true;
-    
-    if (first_enter) {
-        ROS_INFO("[SCANNING_BOARDS] 开始扫描识别板");
-        speak("正在扫描识别板位置");
-        
-        clusters_calculated_ = false;
+// ========== 三状态PCA检测 ==========
 
+void NavigationStateMachine::handleRotationScan() {
+    static bool first_enter = true;
+    static ros::Time rotation_start_time;
+    static float rotation_start_yaw = 0.0f;
+    static bool rotation_active = false;
+
+    if (first_enter) {
+        ROS_INFO("[ROTATION_SCAN] 开始旋转扫描寻找目标物体");
+        speak("开始扫描寻找目标物体");
+        
+        // === 新增：旋转前重置视觉状态 ===
+        try {
+            std_srvs::Trigger reset_srv;
+            ros::ServiceClient reset_client = nh_.serviceClient<std_srvs::Trigger>("/reset_vision_state");
+            
+            if (reset_client.waitForExistence(ros::Duration(1.0))) {
+                if (reset_client.call(reset_srv)) {
+                    if (reset_srv.response.success) {
+                        ROS_INFO("旋转前视觉状态重置成功: %s", reset_srv.response.message.c_str());
+                    } else {
+                        ROS_WARN("旋转前视觉状态重置失败: %s", reset_srv.response.message.c_str());
+                    }
+                } else {
+                    ROS_WARN("旋转前视觉重置服务调用失败");
+                }
+            } else {
+                ROS_WARN("旋转前视觉重置服务不可用，继续执行");
+            }
+        } catch (const std::exception& e) {
+            ROS_WARN("旋转前视觉重置服务异常: %s", e.what());
+        }
+        
+        // 重置状态标志（原有逻辑保持不变）
+        rotation_scan_complete_ = false;
+        pca_calculation_complete_ = false;
+        cached_laser_scans_.clear();
+        current_rotated_angle_ = 0.0f;
+        object_detected_during_scan_ = false;  // 明确重置
+        detected_object_name_ = "";           // 明确重置
+        rotation_active = true;
+        
+        // 获取初始位姿
         if (!getRobotPose(scan_robot_x_, scan_robot_y_, scan_robot_yaw_)) {
             ROS_WARN("无法获取机器人位姿，延迟扫描");
             return;
         }
         
-        current_target_cluster_ = -1;
-        clusters_detected_ = false;
-        detected_clusters_.clear();
-        rotation_optimization_active_ = false;
-        object_detected_during_scan_ = false;
+        rotation_start_yaw = scan_robot_yaw_;
+        rotation_start_time = ros::Time::now();
         
-        scan_start_time_ = ros::Time::now();
+        // 开始旋转
+        geometry_msgs::Twist rotate_cmd;
+        rotate_cmd.angular.z = 0.6f; 
+        cmd_vel_pub_.publish(rotate_cmd);
         
-        ROS_INFO("扫描开始，等待识别板检测...");
+        ROS_INFO("旋转扫描开始，等待视觉识别目标物体...");
+        ROS_INFO("当前任务目标: %s", current_task_.c_str());
         first_enter = false;
         return;
     }
     
-    // 时间统计
-    double time_in_state = (ros::Time::now() - state_start_time_).toSec();
-    double scan_time = (ros::Time::now() - scan_start_time_).toSec();
-    ROS_INFO_THROTTLE(2, "[SCANNING_BOARDS] 状态耗时: %.1f 秒, 扫描耗时: %.1f 秒", time_in_state, scan_time);
-    
-    if (rotation_optimization_active_ && object_detected_during_scan_) {
-        ROS_INFO("旋转过程中检测到目标物体，立即停止旋转");
+    // === 关键修改：持续检查视觉识别结果 ===
+    if (object_detected_during_scan_ && !detected_object_name_.empty()) {
+        ROS_INFO("🎯 检测到目标物体: %s，立即停止旋转", detected_object_name_.c_str());
+        speak("发现目标" + detected_object_name_);
         
+        // 停止旋转
         geometry_msgs::Twist stop_cmd;
         stop_cmd.angular.z = 0.0;
         cmd_vel_pub_.publish(stop_cmd);
+        rotation_active = false;
         
-        // 重要：等待机器人完全停止
+        // 等待机器人稳定
         ros::Duration(0.5).sleep();
         
-        // 更新当前位姿
-        if (!getRobotPose(scan_robot_x_, scan_robot_y_, scan_robot_yaw_)) {
-            ROS_WARN("停止后获取位姿失败");
-        }
+        // 使用当前收集的数据进行PCA计算
+        ROS_INFO("使用已收集的 %zu 帧激光数据进行PCA定位", cached_laser_scans_.size());
         
-        // 重新计算簇排序（基于当前朝向）
-        selectBestCluster();
-        
-        if (current_target_cluster_ >= 0 && current_target_cluster_ < detected_clusters_.size()) {
-            ROS_INFO("选择第 %d 个识别板，切换到导航状态", current_target_cluster_ + 1);
-            setState(RobotState::NAVIGATING_TO_BOARD);
+        if (cached_laser_scans_.size() >= 2) {
+            rotation_scan_complete_ = true;
+            setState(RobotState::PCA_CALCULATION);
         } else {
-            ROS_WARN("无法选择合适识别板，前往等待区");
-            speak("识别板选择失败，继续执行");
-            setState(RobotState::MOVE_TO_WAIT_ZONE);
+            ROS_WARN("收集的激光数据不足，直接进入选择阶段");
+            setState(RobotState::CLUSTER_SELECTION);
         }
         
         first_enter = true;
-        rotation_optimization_active_ = false;
-        object_detected_during_scan_ = false;
-        return;
+        return;  // 重要：立即返回，不再执行后续旋转逻辑
     }
     
-    if (!rotation_optimization_active_ && clusters_detected_ && !detected_clusters_.empty()) {
-        ROS_INFO("检测到 %zu 个识别板，开始旋转优化预计算", detected_clusters_.size());
-        rotation_optimization_active_ = true;
-        rotation_start_yaw_ = scan_robot_yaw_;
-        rotation_start_time_ = ros::Time::now();
-        
+    // 持续发布旋转命令，确保机器人持续旋转
+    if (rotation_active) {
         geometry_msgs::Twist rotate_cmd;
-        rotate_cmd.angular.z = 0.5f;
+        rotate_cmd.angular.z = 0.6f;
         cmd_vel_pub_.publish(rotate_cmd);
-        
-        ROS_INFO("开始旋转优化，目标角度: 180度");
-        return;
     }
     
-    if (rotation_optimization_active_) {
-        float current_x, current_y, current_yaw;
-        if (!getRobotPose(current_x, current_y, current_yaw)) {
-            ROS_WARN("获取当前朝向失败，继续旋转");
-            return;
+    // 更新当前旋转角度（用于超时判断）
+    float current_x, current_y, current_yaw;
+    if (getRobotPose(current_x, current_y, current_yaw)) {
+        current_rotated_angle_ = fabs(current_yaw - rotation_start_yaw);
+        if (current_rotated_angle_ > M_PI) {
+            current_rotated_angle_ = 2 * M_PI - current_rotated_angle_;
+        }
+    }
+    
+    // 时间统计和超时处理
+    double rotation_time = (ros::Time::now() - rotation_start_time).toSec();
+    ROS_INFO_THROTTLE(1, "[ROTATION_SCAN] 旋转中... 进度: %.1f°, 耗时: %.1f秒, 等待目标: %s", 
+                     current_rotated_angle_ * 180 / M_PI, rotation_time, current_task_.c_str());
+    
+    // 超时保护：如果旋转超过一定时间或角度仍未发现目标，停止旋转
+    bool should_timeout = false;
+    if (rotation_time > 15.0) { // 15秒超时
+        should_timeout = true;
+        ROS_WARN("旋转扫描超时，未发现目标物体");
+    } else if (current_rotated_angle_ >= rotation_target_angle_) {
+        should_timeout = true;
+        ROS_WARN("旋转达到目标角度，未发现目标物体");
+    }
+    
+    if (should_timeout && rotation_active) {
+        ROS_WARN("旋转扫描完成，未发现目标物体");
+        speak("未发现目标物体，继续执行");
+        
+        // 停止旋转
+        geometry_msgs::Twist stop_cmd;
+        stop_cmd.angular.z = 0.0;
+        cmd_vel_pub_.publish(stop_cmd);
+        rotation_active = false;
+        
+        // 进入下一状态
+        if (cached_laser_scans_.size() >= 2) {
+            rotation_scan_complete_ = true;
+            setState(RobotState::PCA_CALCULATION);
+        } else {
+            setState(RobotState::CLUSTER_SELECTION);
         }
         
-        float rotated_angle = fabs(current_yaw - rotation_start_yaw_);
-        if (rotated_angle > M_PI) {
-            rotated_angle = 2 * M_PI - rotated_angle;
-        }
+        first_enter = true;
+    }
+}
+
+void NavigationStateMachine::handlePCACalculation() {
+    static bool first_enter = true;
+    
+    if (first_enter) {
+        ROS_INFO("[PCA_CALCULATION] 开始PCA计算");
         
-        double rotation_time = (ros::Time::now() - rotation_start_time_).toSec();
-        ROS_INFO_THROTTLE(1, "旋转优化: %.1f°/180°, 旋转耗时: %.1f 秒", rotated_angle * 180 / M_PI, rotation_time);
+        // 重置检测结果
+        detected_clusters_.clear();
+        detected_cluster_infos_.clear();
+        clusters_detected_ = false;
         
-        bool should_stop = false;
-        std::string stop_reason;
-        
-        if (rotated_angle >= M_PI) {
-            should_stop = true;
-            stop_reason = "旋转角度达到目标";
-        } else if (rotation_time > 12.0) {
-            should_stop = true;
-            stop_reason = "旋转超时";
-        }
-        
-        if (should_stop) {
-            ROS_INFO("停止旋转优化: %s", stop_reason.c_str());
+        // 使用缓存的激光数据进行PCA计算
+        if (!cached_laser_scans_.empty()) {
+            ROS_INFO("使用 %zu 帧缓存激光数据进行PCA计算", cached_laser_scans_.size());
             
-            geometry_msgs::Twist stop_cmd;
-            stop_cmd.angular.z = 0.0;
-            cmd_vel_pub_.publish(stop_cmd);
+            // 使用最后一帧数据进行计算（通常最稳定）
+            const auto& latest_scan = cached_laser_scans_.back();
+            // 创建共享指针来调用函数
+            sensor_msgs::LaserScan::ConstPtr scan_ptr = boost::make_shared<sensor_msgs::LaserScan>(latest_scan);
+            detectObjectClusters(scan_ptr);
             
+            pca_calculation_complete_ = true;
+            ROS_INFO("PCA计算完成，检测到 %zu 个识别板", detected_clusters_.size());
+        } else {
+            ROS_WARN("没有可用的激光数据，PCA计算跳过");
+        }
+        
+        first_enter = false;
+    }
+    
+    // PCA计算是瞬时操作，完成后立即进入下一状态
+    if (pca_calculation_complete_) {
+        setState(RobotState::CLUSTER_SELECTION);
+    }
+}
+
+void NavigationStateMachine::handleClusterSelection() {
+    static bool first_enter = true;
+    
+    if (first_enter) {
+        ROS_INFO("[CLUSTER_SELECTION] 开始簇选择");
+        
+        if (clusters_detected_ && !detected_clusters_.empty()) {
+            // 选择最佳识别板
             selectBestCluster();
             
             if (current_target_cluster_ >= 0 && current_target_cluster_ < detected_clusters_.size()) {
-                ROS_INFO("选择第 %d 个识别板，切换到导航状态", current_target_cluster_ + 1);
+                ROS_INFO("成功选择第 %d 个识别板，切换到导航状态", current_target_cluster_ + 1);
+                speak("找到识别板，开始导航");
                 setState(RobotState::NAVIGATING_TO_BOARD);
             } else {
-                ROS_WARN("无法选择合适识别板，前往等待区");
-                speak("识别板选择失败，继续执行");
+                ROS_WARN("簇选择失败，前往等待区");
+                speak("未找到合适识别板，继续执行");
                 setState(RobotState::MOVE_TO_WAIT_ZONE);
             }
-            
-            first_enter = true;
-            rotation_optimization_active_ = false;
-        }
-        return;
-    }
-    
-    if (!clusters_detected_ || detected_clusters_.empty()) {
-        ROS_INFO_THROTTLE(2, "等待识别板检测...");
-        
-        if (scan_time > LASER_SCAN_TIMEOUT) {
-            ROS_WARN("扫描总超时，未检测到识别板，扫描耗时: %.1f 秒", scan_time);
-            speak("未找到识别板，继续执行");
+        } else {
+            ROS_WARN("没有检测到有效识别板，前往等待区");
+            speak("未检测到识别板，继续执行");
             setState(RobotState::MOVE_TO_WAIT_ZONE);
-            first_enter = true;
         }
+        
+        first_enter = false;
     }
 }
 
@@ -320,7 +427,6 @@ void NavigationStateMachine::handleNavigatingToBoard() {
         goal.target_pose.header.stamp = ros::Time::now();
         goal.target_pose.header.frame_id = "map";
         
-        // 使用标准回调，智能停止由 navFeedbackCallback 处理
         action_client_.sendGoal(goal,
             boost::bind(&NavigationStateMachine::navDoneCallback, this, _1, _2),
             boost::bind(&NavigationStateMachine::navActiveCallback, this),
@@ -636,7 +742,7 @@ void NavigationStateMachine::handleErrorState() {
         setState(RobotState::MOVE_TO_WAIT_ZONE);
     } else {
         ROS_INFO("恢复：重新寻找物体");
-        setState(RobotState::SCANNING_BOARDS);
+        setState(RobotState::ROTATION_SCAN); // 修改为新的起始状态
     }
     
     ros::Duration(1.0).sleep();
@@ -676,7 +782,11 @@ const char* NavigationStateMachine::getStateName(RobotState state) {
         case RobotState::MOVE_TO_QR_ZONE: return "MOVE_TO_QR_ZONE";
         case RobotState::WAITING_QR_SERVICE: return "WAITING_QR_SERVICE";
         case RobotState::MOVE_TO_PICK_ZONE: return "MOVE_TO_PICK_ZONE";
-        case RobotState::SCANNING_BOARDS: return "SCANNING_BOARDS";
+        // 新增三状态
+        case RobotState::ROTATION_SCAN: return "ROTATION_SCAN";
+        case RobotState::PCA_CALCULATION: return "PCA_CALCULATION";
+        case RobotState::CLUSTER_SELECTION: return "CLUSTER_SELECTION";
+        // 原有状态
         case RobotState::NAVIGATING_TO_BOARD: return "NAVIGATING_TO_BOARD";
         case RobotState::WAITING_VISUAL: return "WAITING_VISUAL";
         case RobotState::OBJECT_CONFIRMED: return "OBJECT_CONFIRMED";
@@ -689,6 +799,119 @@ const char* NavigationStateMachine::getStateName(RobotState state) {
         case RobotState::ERROR: return "ERROR";
         default: return "UNKNOWN";
     }
+}
+
+// ========== PCA核心算法 ==========
+
+PCAResult NavigationStateMachine::computePCA(const std::vector<int>& cluster, 
+                                            const sensor_msgs::LaserScan::ConstPtr& scan) {
+    PCAResult result;
+    
+    if (cluster.size() < 5) {
+        ROS_WARN("PCA计算需要至少5个点，当前只有%zu个点", cluster.size());
+        return result;
+    }
+    
+    // 步骤1: 收集所有点的全局坐标
+    std::vector<float> points_x, points_y;
+    for(int idx : cluster) {
+        float dist = scan->ranges[idx];
+        float angle = scan->angle_min + idx * scan->angle_increment;
+        
+        float local_x = dist * cos(angle);
+        float local_y = dist * sin(angle);
+        
+        float global_x = scan_robot_x_ + local_x * cos(scan_robot_yaw_) - local_y * sin(scan_robot_yaw_);
+        float global_y = scan_robot_y_ + local_x * sin(scan_robot_yaw_) + local_y * cos(scan_robot_yaw_);
+        
+        points_x.push_back(global_x);
+        points_y.push_back(global_y);
+    }
+    
+    // 步骤2: 计算均值（中心化）
+    float mean_x = 0.0f, mean_y = 0.0f;
+    for(size_t i = 0; i < points_x.size(); ++i) {
+        mean_x += points_x[i];
+        mean_y += points_y[i];
+    }
+    mean_x /= points_x.size();
+    mean_y /= points_y.size();
+    
+    // 步骤3: 计算协方差矩阵
+    float cov_xx = 0.0f, cov_yy = 0.0f, cov_xy = 0.0f;
+    for(size_t i = 0; i < points_x.size(); ++i) {
+        float dx = points_x[i] - mean_x;
+        float dy = points_y[i] - mean_y;
+        cov_xx += dx * dx;
+        cov_yy += dy * dy;
+        cov_xy += dx * dy;
+    }
+    cov_xx /= points_x.size();
+    cov_yy /= points_y.size();
+    cov_xy /= points_x.size();
+    
+    // 步骤4: 计算特征值和特征向量（2D PCA解析解）
+    float trace = cov_xx + cov_yy;
+    float determinant = cov_xx * cov_yy - cov_xy * cov_xy;
+    float discriminant = trace * trace - 4 * determinant;
+    
+    if (discriminant < 0) {
+        ROS_WARN("PCA计算异常: 判别式为负");
+        return result;
+    }
+    
+    // 特征值
+    float lambda1 = (trace + sqrt(discriminant)) / 2;
+    float lambda2 = (trace - sqrt(discriminant)) / 2;
+    
+    // 第一主成分方向（对应最大特征值）
+    float principal_x, principal_y;
+    if(fabs(cov_xy) > 1e-6) {
+        principal_x = lambda1 - cov_yy;
+        principal_y = cov_xy;
+    } else {
+        // 如果协方差为0，选择方差较大的方向
+        principal_x = (cov_xx >= cov_yy) ? 1.0f : 0.0f;
+        principal_y = (cov_xx >= cov_yy) ? 0.0f : 1.0f;
+    }
+    
+    // 归一化方向向量
+    float norm = sqrt(principal_x * principal_x + principal_y * principal_y);
+    if (norm < 1e-6) {
+        ROS_WARN("PCA方向向量模长为0");
+        return result;
+    }
+    principal_x /= norm;
+    principal_y /= norm;
+    
+    // 步骤5: 计算投影范围
+    float min_proj = std::numeric_limits<float>::max();
+    float max_proj = std::numeric_limits<float>::lowest();
+    
+    for(size_t i = 0; i < points_x.size(); ++i) {
+        float proj = (points_x[i] - mean_x) * principal_x + 
+                    (points_y[i] - mean_y) * principal_y;
+        min_proj = std::min(min_proj, proj);
+        max_proj = std::max(max_proj, proj);
+    }
+    
+    // 步骤6: 设置结果
+    result.length = max_proj - min_proj;
+    result.orientation = atan2(principal_y, principal_x);
+    result.confidence = (lambda1 + lambda2 > 1e-6) ? lambda1 / (lambda1 + lambda2) : 0.0f;
+    
+    // 计算投影起点和终点
+    result.start_point.x = mean_x + min_proj * principal_x;
+    result.start_point.y = mean_y + min_proj * principal_y;
+    result.start_point.z = 0.0;
+    result.end_point.x = mean_x + max_proj * principal_x;
+    result.end_point.y = mean_y + max_proj * principal_y;
+    result.end_point.z = 0.0;
+    
+    ROS_DEBUG("PCA结果: 长度=%.3fm, 朝向=%.1f°, 置信度=%.3f", 
+             result.length, result.orientation * 180/M_PI, result.confidence);
+    
+    return result;
 }
 
 // ========== 激光雷达相关函数 ==========
@@ -709,20 +932,12 @@ void NavigationStateMachine::laserCallback(const sensor_msgs::LaserScan::ConstPt
     obstacle_distance_ = min_distance;
     obstacle_detected_ = (min_distance <= TARGET_OBSTACLE_DISTANCE);
     
-    if (current_state_ == RobotState::SCANNING_BOARDS) {
-        if (!getRobotPose(scan_robot_x_, scan_robot_y_, scan_robot_yaw_)) {
-            ROS_WARN_THROTTLE(2, "扫描状态获取位姿失败");
-            return;
-        }
-        
-        if (!clusters_calculated_ && !rotation_optimization_active_) {
-            detectObjectClusters(msg);
-            
-            if (!detected_clusters_.empty()) {
-                clusters_detected_ = true;
-                clusters_calculated_ = true;
-                ROS_DEBUG_THROTTLE(2, "检测到 %zu 个识别板", detected_clusters_.size());
-            }
+    // 在旋转扫描状态下缓存激光数据
+    if (current_state_ == RobotState::ROTATION_SCAN) {
+        // 限制缓存数量，避免内存过度增长
+        if (cached_laser_scans_.size() < max_cached_scans_) {
+            cached_laser_scans_.push_back(*msg);
+            ROS_DEBUG_THROTTLE(2, "缓存激光数据，当前帧数: %zu", cached_laser_scans_.size());
         }
     }
 }
@@ -734,6 +949,7 @@ void NavigationStateMachine::objectDetectedCallback(const std_msgs::String::Cons
         return;
     }
     
+    // 任务匹配检查
     if (!current_task_.empty()) {
         bool is_fruit = (detected_object == "香蕉" || detected_object == "西瓜" || detected_object == "苹果");
         bool is_food = (detected_object == "蛋糕" || detected_object == "牛奶" || detected_object == "可乐");
@@ -750,11 +966,13 @@ void NavigationStateMachine::objectDetectedCallback(const std_msgs::String::Cons
         }
     }
     
-    ROS_INFO("检测到目标物体: %s", detected_object.c_str());
+    ROS_INFO("✅ 视觉检测到目标物体: %s", detected_object.c_str());
     
-    if (current_state_ == RobotState::SCANNING_BOARDS) {
+    // 关键修改：在旋转扫描状态下立即记录检测结果
+    if (current_state_ == RobotState::ROTATION_SCAN) {
         object_detected_during_scan_ = true;
         detected_object_name_ = detected_object;
+        ROS_INFO("🎯 旋转扫描中检测到目标，准备停止旋转");
     }
 }
 
@@ -796,46 +1014,46 @@ void NavigationStateMachine::detectObjectClusters(const sensor_msgs::LaserScan::
     detected_clusters_.clear();
     detected_cluster_infos_.clear(); 
 
-    // 添加静态变量控制输出频率
-    static bool first_detection = true;
-    static ros::Time last_output_time = ros::Time::now();
-    
-    // 只在第一次检测或超过3秒时输出详细信息
-    bool should_output_details = first_detection || 
-                                (ros::Time::now() - last_output_time).toSec() > 3.0;
-    
-    if (should_output_details) {
-        ROS_INFO("=== 动态聚类识别板检测 ===");
-        first_detection = false;
-        last_output_time = ros::Time::now();
-    }
+    ROS_INFO("=== PCA聚类识别板检测开始 ===");
+    ROS_INFO("机器人位置: (%.2f, %.2f, %.1f°)", scan_robot_x_, scan_robot_y_, scan_robot_yaw_ * 180 / M_PI);
 
     std::vector<std::vector<int>> clusters;
     std::vector<int> current_cluster;
     
-    const float MAX_DISTANCE_JUMP = 0.1f;
-    const float MIN_VALID_RANGE = 0.1f;
-    const float MAX_VALID_RANGE = 4.0f;
-    
-    // 动态聚类算法（移除内部调试输出）
-    for (size_t i = 0; i < scan->ranges.size(); ++i) {
+    // PCA动态聚类算法
+    for(size_t i = 0; i < scan->ranges.size(); ++i) {
         float dist = scan->ranges[i];
         
-        if (!std::isfinite(dist) || dist < MIN_VALID_RANGE || dist > MAX_VALID_RANGE) {
-            if (!current_cluster.empty() && current_cluster.size() >= 5) {
+        if(!std::isfinite(dist) || dist < pca_params_.min_valid_range || dist > pca_params_.max_valid_range) {
+            if(!current_cluster.empty() && current_cluster.size() >= pca_params_.min_cluster_size) {
                 clusters.push_back(current_cluster);
             }
             current_cluster.clear();
             continue;
         }
         
-        if (current_cluster.empty()) {
+        if(current_cluster.empty()) {
             current_cluster.push_back(i);
             continue;
         }
         
         int prev_idx = current_cluster.back();
         float prev_dist = scan->ranges[prev_idx];
+
+        // 距离梯度检查
+        float distance_gradient = fabs(dist - prev_dist);
+        const float GRADIENT_THRESHOLD = 0.3f;
+        
+        if(distance_gradient > GRADIENT_THRESHOLD) {
+            // 立即分割当前聚类
+            if(!current_cluster.empty() && current_cluster.size() >= pca_params_.min_cluster_size) {
+                clusters.push_back(current_cluster);
+            }
+            current_cluster.clear();
+            current_cluster.push_back(i);
+            continue;
+        }
+
         float prev_angle = scan->angle_min + prev_idx * scan->angle_increment;
         float curr_angle = scan->angle_min + i * scan->angle_increment;
         
@@ -845,10 +1063,10 @@ void NavigationStateMachine::detectObjectClusters(const sensor_msgs::LaserScan::
         float y2 = dist * sin(curr_angle);
         float physical_distance = sqrt(pow(x2 - x1, 2) + pow(y2 - y1, 2));
         
-        if (physical_distance < MAX_DISTANCE_JUMP) {
+        if(physical_distance < pca_params_.max_distance_jump) {
             current_cluster.push_back(i);
         } else {
-            if (current_cluster.size() >= 12) {
+            if(current_cluster.size() >= pca_params_.min_cluster_size) {
                 clusters.push_back(current_cluster);
             }
             current_cluster.clear();
@@ -856,123 +1074,101 @@ void NavigationStateMachine::detectObjectClusters(const sensor_msgs::LaserScan::
         }
     }
     
-    if (!current_cluster.empty() && current_cluster.size() >= 8) {
+    if(!current_cluster.empty() && current_cluster.size() >= pca_params_.min_cluster_size) {
         clusters.push_back(current_cluster);
     }
     
-    if (should_output_details) {
-        ROS_INFO("动态聚类结果: %zu个候选簇", clusters.size());
-    }
+    ROS_INFO("PCA初步聚类完成，共 %zu 个候选簇", clusters.size());
     
-    // 临时存储所有有效识别板
+    // 处理每个簇
     std::vector<geometry_msgs::Point> temp_clusters;
     std::vector<ClusterInfo> temp_infos;
     
-    for (const auto& cluster : clusters) {
+    int valid_clusters = 0;
+    for(size_t i = 0; i < clusters.size(); ++i) {
+        const auto& cluster = clusters[i];
         ClusterInfo cluster_info = calculateClusterInfo(cluster, scan);
-        float length = calculateBoardLength(cluster, scan);
         
-        // 只在详细输出时显示候选簇信息
-        if (should_output_details) {
-            ROS_INFO("候选簇: 大小=%zu, 长度=%.3fm, 距离=%.2fm, 中心点=(%.2f, %.2f), 朝向=%.1f°", 
-                    cluster.size(), length, cluster_info.average_distance, 
-                    cluster_info.center.x, cluster_info.center.y, cluster_info.board_yaw * 180 / M_PI);
-        }
+        std::string debug_info;
+        bool isValid = isValidObjectCluster(cluster_info, cluster, scan, debug_info);
         
-        if (isValidObjectCluster(cluster_info, cluster, scan)) {
+        if(isValid) {
             geometry_msgs::Point safe_target = calculateSafeTarget(cluster_info);
             temp_clusters.push_back(safe_target);
             temp_infos.push_back(cluster_info);
+            valid_clusters++;
             
-            // 只在详细输出时显示接受信息
-            if (should_output_details) {
-                ROS_INFO("✅ 识别板: 原始位置(%.2f,%.2f) -> 安全位置(%.2f,%.2f), 朝向=%.1f°, 长度=%.3fm", 
-                        cluster_info.center.x, cluster_info.center.y,
-                        safe_target.x, safe_target.y, cluster_info.board_yaw * 180 / M_PI, length);
-            }
+            ROS_INFO("✅ PCA聚类 %zu 有效: 长度=%.3fm, 距离=%.2fm, 置信度=%.3f", 
+                    i+1, cluster_info.length, cluster_info.average_distance, 
+                    cluster_info.pca_confidence);
+        } else {
+            ROS_WARN("❌ PCA聚类 %zu 被过滤: %s", i+1, debug_info.c_str());
         }
     }
     
-    // ========== 精简重复检测 ==========
+    // 去重处理
     std::vector<bool> keep_flag(temp_clusters.size(), true);
-    const float DUPLICATE_DISTANCE = 0.3f;
-    
-    for (size_t i = 0; i < temp_clusters.size(); ++i) {
-        if (!keep_flag[i]) continue;
+    int duplicates_removed = 0;
+    for(size_t i = 0; i < temp_clusters.size(); ++i) {
+        if(!keep_flag[i]) continue;
         
-        for (size_t j = i + 1; j < temp_clusters.size(); ++j) {
-            if (!keep_flag[j]) continue;
+        for(size_t j = i + 1; j < temp_clusters.size(); ++j) {
+            if(!keep_flag[j]) continue;
             
             float dx = temp_clusters[i].x - temp_clusters[j].x;
             float dy = temp_clusters[i].y - temp_clusters[j].y;
             float distance = sqrt(dx*dx + dy*dy);
             
-            if (distance < DUPLICATE_DISTANCE) {
+            if(distance < pca_params_.duplicate_distance) {
                 float dist_i = sqrt(pow(temp_clusters[i].x - scan_robot_x_, 2) + 
                                    pow(temp_clusters[i].y - scan_robot_y_, 2));
                 float dist_j = sqrt(pow(temp_clusters[j].x - scan_robot_x_, 2) + 
                                    pow(temp_clusters[j].y - scan_robot_y_, 2));
                 
-                if (dist_i < dist_j) {
+                if(dist_i < dist_j) {
                     keep_flag[j] = false;
-                    if (should_output_details) {
-                        ROS_INFO("过滤重复识别板: 保留索引%zu(距离%.2fm), 过滤索引%zu(距离%.2fm)", 
-                                 i, dist_i, j, dist_j);
-                    }
                 } else {
                     keep_flag[i] = false;
-                    if (should_output_details) {
-                        ROS_INFO("过滤重复识别板: 保留索引%zu(距离%.2fm), 过滤索引%zu(距离%.2fm)", 
-                                 j, dist_j, i, dist_i);
-                    }
                     break;
                 }
+                duplicates_removed++;
             }
         }
     }
     
-    // 收集非重复的识别板
-    for (size_t i = 0; i < temp_clusters.size(); ++i) {
-        if (keep_flag[i]) {
+    if(duplicates_removed > 0) {
+        ROS_INFO("PCA去重处理完成，移除了 %d 个重复聚类", duplicates_removed);
+    }
+    
+    // 更新检测结果
+    for(size_t i = 0; i < temp_clusters.size(); ++i) {
+        if(keep_flag[i]) {
             detected_clusters_.push_back(temp_clusters[i]);
             detected_cluster_infos_.push_back(temp_infos[i]);
         }
     }
     
-   // ========== 精简优先级排序 ==========
- if (!detected_clusters_.empty()) {
-        std::vector<std::pair<size_t, float>> point_scores;
+    clusters_detected_ = !detected_clusters_.empty();
+    
+    if(clusters_detected_) {
+        ROS_INFO("🎯 PCA最终检测到 %zu 个识别板", detected_clusters_.size());
         
-        for (size_t i = 0; i < detected_clusters_.size(); ++i) {
-            float score = 0.0f;
+        // 显示最终有效的板子列表
+        for(size_t i = 0; i < detected_clusters_.size(); ++i) {
+            const auto& cluster = detected_clusters_[i];
+            const auto& info = detected_cluster_infos_[i];
             
-            float dx_to_robot = detected_clusters_[i].x - scan_robot_x_;
-            float dy_to_robot = detected_clusters_[i].y - scan_robot_y_;
-            float to_point_yaw = atan2(dy_to_robot, dx_to_robot);
-            float angle_diff = fabs(to_point_yaw - scan_robot_yaw_);
-            if (angle_diff > M_PI) angle_diff = 2 * M_PI - angle_diff;
-            
-            float direction_score = 1.0f - (angle_diff / M_PI);
-            score = direction_score;
-            
-            point_scores.push_back({i, score});
+            ROS_INFO("识别板 %zu:", i+1);
+            ROS_INFO("  ├─ 板子中心: (%.2f, %.2f)", info.center.x, info.center.y);
+            ROS_INFO("  ├─ 安全目标点: (%.2f, %.2f)", cluster.x, cluster.y);
+            ROS_INFO("  ├─ PCA长度: %.3fm", info.length);
+            ROS_INFO("  ├─ PCA朝向: %.1f°", info.board_yaw * 180 / M_PI);
+            ROS_INFO("  ├─ PCA置信度: %.3f", info.pca_confidence);
+            ROS_INFO("  ├─ 距离: %.1fm", info.average_distance);
+            ROS_INFO("  └─ 点数: %zu", info.size);
         }
-        
-        std::sort(point_scores.begin(), point_scores.end(), 
-                  [](const auto& a, const auto& b) { return a.second > b.second; });
-        
-        std::vector<geometry_msgs::Point> sorted_clusters;
-        std::vector<ClusterInfo> sorted_infos;
-
-        for (const auto& item : point_scores) {
-            sorted_clusters.push_back(detected_clusters_[item.first]);
-            sorted_infos.push_back(detected_cluster_infos_[item.first]);
-        }
-
-        detected_clusters_ = sorted_clusters;
-        detected_cluster_infos_ = sorted_infos;
-        
-        ROS_INFO("安全点排序完成，优先检查正前方的识别板");
+    } else {
+        ROS_INFO("⚠️ PCA未检测到符合标准的识别板");
     }
 }
 
@@ -982,25 +1178,17 @@ NavigationStateMachine::ClusterInfo NavigationStateMachine::calculateClusterInfo
     float sum_x = 0.0f, sum_y = 0.0f;
     float sum_dist = 0.0f;
     
-    // 使用扫描时缓存的机器人位姿，避免频繁TF查询
-    float robot_x = scan_robot_x_;
-    float robot_y = scan_robot_y_;
-    float robot_yaw = scan_robot_yaw_;
-    
-    // 存储所有点的全局坐标用于线性拟合
     std::vector<float> global_x_points, global_y_points;
     
-    for (int idx : cluster) {
+    for(int idx : cluster) {
         float dist = scan->ranges[idx];
         float angle = scan->angle_min + idx * scan->angle_increment;
         
-        // 极坐标转机器人坐标系
         float local_x = dist * cos(angle);
         float local_y = dist * sin(angle);
         
-        // 转全局坐标系
-        float global_x = robot_x + local_x * cos(robot_yaw) - local_y * sin(robot_yaw);
-        float global_y = robot_y + local_x * sin(robot_yaw) + local_y * cos(robot_yaw);
+        float global_x = scan_robot_x_ + local_x * cos(scan_robot_yaw_) - local_y * sin(scan_robot_yaw_);
+        float global_y = scan_robot_y_ + local_x * sin(scan_robot_yaw_) + local_y * cos(scan_robot_yaw_);
         
         sum_x += global_x;
         sum_y += global_y;
@@ -1017,188 +1205,125 @@ NavigationStateMachine::ClusterInfo NavigationStateMachine::calculateClusterInfo
     info.size = cluster.size();
     info.angular_width = (cluster.back() - cluster.front()) * scan->angle_increment;
     
-    // ========== 线性拟合计算板子朝向 ==========
-    if (global_x_points.size() >= 5) {
-        float sum_x = 0.0f, sum_y = 0.0f, sum_xy = 0.0f, sum_x2 = 0.0f;
-        int n = global_x_points.size();
-        
-        for (int i = 0; i < n; ++i) {
-            sum_x += global_x_points[i];
-            sum_y += global_y_points[i];
-            sum_xy += global_x_points[i] * global_y_points[i];
-            sum_x2 += global_x_points[i] * global_x_points[i];
-        }
-        
-        float denominator = n * sum_x2 - sum_x * sum_x;
-        if (fabs(denominator) > 1e-6) {
-            float k = (n * sum_xy - sum_x * sum_y) / denominator;
-            
-            // 板子朝向是垂直于拟合直线的方向（法线方向）
-            info.board_yaw = atan2(1.0f, -k);
-            
-            // 确保朝向指向机器人（板子正面对着机器人）
-            float dx = info.center.x - robot_x;
-            float dy = info.center.y - robot_y;
-            float dot_product = cos(info.board_yaw) * dx + sin(info.board_yaw) * dy;
-            if (dot_product < 0) {
-                // 如果点积为负，说明朝向背对机器人，需要翻转180度
-                info.board_yaw += M_PI;
-                ROS_INFO("板子朝向翻转180度以面向机器人");
-            }
-            
-            // 归一化到 [-π, π]
-            while (info.board_yaw > M_PI) info.board_yaw -= 2 * M_PI;
-            while (info.board_yaw < -M_PI) info.board_yaw += 2 * M_PI;
-            
-            ROS_INFO("板子朝向: 拟合斜率=%.3f, 最终朝向=%.1f°", k, info.board_yaw * 180 / M_PI);
-        } else {
-            info.board_yaw = M_PI / 2;
-            ROS_WARN("板子朝向: 垂直线，使用默认朝向90°");
-        }
-    } else {
-        float dx = info.center.x - robot_x;
-        float dy = info.center.y - robot_y;
-        info.board_yaw = atan2(dy, dx);
-        ROS_WARN("点数不足(%zu)，使用朝向机器人方向: %.1f°", global_x_points.size(), info.board_yaw * 180 / M_PI);
+    // 使用PCA计算板子朝向和长度
+    PCAResult pca_result = computePCA(cluster, scan);
+    info.length = pca_result.length;
+    info.pca_confidence = pca_result.confidence;
+    
+    // 计算法向量并选择面向机器人的一侧
+    float principal_yaw = pca_result.orientation;
+    float normal_yaw = principal_yaw + M_PI / 2;
+    
+    // 确保法向量面向机器人
+    float dx = info.center.x - scan_robot_x_;
+    float dy = info.center.y - scan_robot_y_;
+    
+    float normal_dx = cos(normal_yaw);
+    float normal_dy = sin(normal_yaw);
+    float dot_product = normal_dx * dx + normal_dy * dy;
+    
+    // 如果点积为负，说明法向量背对机器人，需要翻转180度
+    if (dot_product < 0) {
+        normal_yaw += M_PI;
+        ROS_DEBUG("法向量翻转180度，从背对机器人调整为面向机器人");
     }
+    
+    // 归一化到 [-π, π]
+    while(normal_yaw > M_PI) normal_yaw -= 2 * M_PI;
+    while(normal_yaw < -M_PI) normal_yaw += 2 * M_PI;
+    
+    // 使用法向量作为最终朝向
+    info.board_yaw = normal_yaw;
+    
+    ROS_INFO("PCA计算: 长度=%.3fm, 主方向=%.1f°, 法向量=%.1f°, 置信度=%.3f", 
+             info.length, principal_yaw * 180 / M_PI, 
+             info.board_yaw * 180 / M_PI, info.pca_confidence);
     
     return info;
 }
 
 bool NavigationStateMachine::isValidObjectCluster(const ClusterInfo& cluster_info, 
                                                 const std::vector<int>& cluster,
-                                                const sensor_msgs::LaserScan::ConstPtr& scan) {
-    float estimated_length = calculateBoardLength(cluster, scan);
-    float angular_width_deg = cluster_info.angular_width * 180/M_PI;
+                                                const sensor_msgs::LaserScan::ConstPtr& scan,
+                                                std::string& debug_info) {
+    std::ostringstream oss;
     
-    ROS_INFO("物体特征: 长度=%.3fm, 宽度=%.1f°, 距离=%.2fm, 大小=%zu", 
-             estimated_length, angular_width_deg, cluster_info.average_distance, cluster.size());
+    // 地理约束检查
+    float x = cluster_info.center.x;
+    float y = cluster_info.center.y;
     
-    // 验证条件
-    if (estimated_length < 0.2f || estimated_length > 0.9f) {
-        ROS_DEBUG("长度不合适: %.3fm", estimated_length);
+    if (x < pca_params_.valid_min_x || x > pca_params_.valid_max_x || 
+        y < pca_params_.valid_min_y || y > pca_params_.valid_max_y) {
+        oss << "超出有效区域: (" << x << "," << y << ") 不在 [" 
+            << pca_params_.valid_min_x << "," << pca_params_.valid_max_x << "]x[" 
+            << pca_params_.valid_min_y << "," << pca_params_.valid_max_y << "]";
+        debug_info = oss.str();
+        return false;
+    }
+
+    // 基本长度检查
+    if(cluster_info.length < pca_params_.min_board_length) {
+        oss << "PCA长度过小: " << cluster_info.length << "m < " << pca_params_.min_board_length << "m";
+        debug_info = oss.str();
         return false;
     }
     
-    if (cluster_info.average_distance < 0.1f || cluster_info.average_distance > 3.0f) {
-        ROS_DEBUG("距离不合适: %.2fm", cluster_info.average_distance);
+    if(cluster_info.length > pca_params_.max_board_length) {
+        oss << "PCA长度过大: " << cluster_info.length << "m > " << pca_params_.max_board_length << "m";
+        debug_info = oss.str();
         return false;
     }
     
-    if (cluster.size() < 8) {
-        ROS_DEBUG("簇太小: %zu点", cluster.size());
+    // 点数检查
+    if(cluster.size() < pca_params_.min_cluster_size) {
+        oss << "点数过少: " << cluster.size() << " < " << pca_params_.min_cluster_size;
+        debug_info = oss.str();
         return false;
     }
     
-    // 角度跨度过滤（避免墙壁）
-    if (cluster_info.angular_width > 0.4f) {
-        ROS_DEBUG("角度跨度太大: %.1f°", angular_width_deg);
+    // PCA置信度检查
+    if(cluster_info.pca_confidence < pca_params_.min_pca_confidence) {
+        oss << "PCA置信度过低: " << cluster_info.pca_confidence << " < " << pca_params_.min_pca_confidence;
+        debug_info = oss.str();
         return false;
     }
     
-    ROS_INFO("✅ 接受物体簇");
+    // 距离连续性检查
+    float distance_std = 0.0f;
+    float mean_dist = cluster_info.average_distance;
+    for(int idx : cluster) {
+        float diff = scan->ranges[idx] - mean_dist;
+        distance_std += diff * diff;
+    }
+    distance_std = sqrt(distance_std / cluster.size());
+    
+    if(distance_std > pca_params_.max_distance_std) {
+        oss << "距离变化过大: 标准差=" << distance_std << "m > " << pca_params_.max_distance_std << "m";
+        debug_info = oss.str();
+        return false;
+    }
+    
+    debug_info = "PCA符合识别板特征";
     return true;
-}
-
-void NavigationStateMachine::selectBestCluster() {
-    if (detected_clusters_.empty()) {
-        current_target_cluster_ = -1;
-        return;
-    }
-    
-    // 获取当前机器人位姿
-    float current_x, current_y, current_yaw;
-    if (!getRobotPose(current_x, current_y, current_yaw)) {
-        ROS_WARN("无法获取当前位姿，使用默认选择");
-        current_target_cluster_ = 0;
-        return;
-    }
-    
-    // 基于当前朝向重新排序
-    std::vector<std::pair<size_t, float>> point_scores;
-    
-    for (size_t i = 0; i < detected_clusters_.size(); ++i) {
-        float dx_to_robot = detected_clusters_[i].x - current_x;
-        float dy_to_robot = detected_clusters_[i].y - current_y;
-        float to_point_yaw = atan2(dy_to_robot, dx_to_robot);
-        
-        // 计算与当前朝向的角度差
-        float angle_diff = fabs(to_point_yaw - current_yaw);
-        if (angle_diff > M_PI) {
-            angle_diff = 2 * M_PI - angle_diff;
-        }
-        
-        // 评分：角度差越小，评分越高
-        float direction_score = 1.0f - (angle_diff / M_PI);
-        point_scores.push_back({i, direction_score});
-        
-        ROS_INFO("识别板[%zu]方向评分: 角度差=%.1f°, 得分=%.3f", 
-                 i, angle_diff * 180 / M_PI, direction_score);
-    }
-    
-    // 按评分排序
-    std::sort(point_scores.begin(), point_scores.end(), 
-              [](const auto& a, const auto& b) { return a.second > b.second; });
-    
-    // 重新排序簇
-    std::vector<geometry_msgs::Point> sorted_clusters;
-    std::vector<ClusterInfo> sorted_infos;
-
-    for (const auto& item : point_scores) {
-        sorted_clusters.push_back(detected_clusters_[item.first]);
-        sorted_infos.push_back(detected_cluster_infos_[item.first]);
-    }
-
-    detected_clusters_ = sorted_clusters;
-    detected_cluster_infos_ = sorted_infos;
-    
-    current_target_cluster_ = 0;
-    
-    ROS_INFO("=== 最终选择结果 ===");
-    for (size_t i = 0; i < detected_clusters_.size(); ++i) {
-        ROS_INFO("排序[%zu]: 位置(%.2f, %.2f), 原索引=%zu", 
-                 i, detected_clusters_[i].x, detected_clusters_[i].y, 
-                 point_scores[i].first);
-    }
-    
-    ROS_INFO("选择最优识别板[0]: 位置(%.2f, %.2f)", 
-             detected_clusters_[0].x, detected_clusters_[0].y);
 }
 
 float NavigationStateMachine::calculateBoardLength(const std::vector<int>& cluster, 
                                                  const sensor_msgs::LaserScan::ConstPtr& scan) {
-    if (cluster.size() < 2) return 0.0f;
+    if (cluster.size() < 5) {
+        ROS_WARN("PCA长度计算需要至少5个点，当前只有%zu个点", cluster.size());
+        return 0.0f;
+    }
     
-    // 使用扫描时缓存的机器人位姿
-    float robot_x = scan_robot_x_;
-    float robot_y = scan_robot_y_;
-    float robot_yaw = scan_robot_yaw_;
+    PCAResult pca_result = computePCA(cluster, scan);
     
-    // 计算簇的起点和终点在全局坐标系中的位置
-    int first_idx = cluster.front();
-    int last_idx = cluster.back();
+    ROS_INFO("=== PCA长度计算 ===");
+    ROS_INFO("输入点数: %zu", cluster.size());
+    ROS_INFO("PCA长度: %.3fm", pca_result.length);
+    ROS_INFO("PCA朝向: %.1f°", pca_result.orientation * 180 / M_PI);
+    ROS_INFO("PCA置信度: %.3f", pca_result.confidence);
+    ROS_INFO("=================");
     
-    // 起点坐标
-    float dist1 = scan->ranges[first_idx];
-    float angle1 = scan->angle_min + first_idx * scan->angle_increment;
-    float global_x1 = robot_x + dist1 * cos(robot_yaw + angle1);
-    float global_y1 = robot_y + dist1 * sin(robot_yaw + angle1);
-    
-    // 终点坐标  
-    float dist2 = scan->ranges[last_idx];
-    float angle2 = scan->angle_min + last_idx * scan->angle_increment;
-    float global_x2 = robot_x + dist2 * cos(robot_yaw + angle2);
-    float global_y2 = robot_y + dist2 * sin(robot_yaw + angle2);
-    
-    // 计算直线距离
-    float dx = global_x2 - global_x1;
-    float dy = global_y2 - global_y1;
-    float straight_line_distance = sqrt(dx*dx + dy*dy);
-    
-    ROS_INFO("端点距离: 起点(%.2f,%.2f) 终点(%.2f,%.2f) 直线长度=%.3fm", 
-             global_x1, global_y1, global_x2, global_y2, straight_line_distance);
-    
-    return straight_line_distance;
+    return pca_result.length;
 }
 
 void NavigationStateMachine::clusterArrivedCallback(const actionlib::SimpleClientGoalState& state,
@@ -1352,7 +1477,7 @@ void NavigationStateMachine::navDoneCallback(const actionlib::SimpleClientGoalSt
                 setState(RobotState::WAITING_QR_SERVICE);
                 break;
             case RobotState::MOVE_TO_PICK_ZONE:
-                setState(RobotState::SCANNING_BOARDS);
+                setState(RobotState::ROTATION_SCAN); // 修改为新的起始状态
                 break;
             case RobotState::MOVE_TO_WAIT_ZONE:
                 setState(RobotState::WAITING_SIMULATION);
@@ -1361,12 +1486,13 @@ void NavigationStateMachine::navDoneCallback(const actionlib::SimpleClientGoalSt
                 setState(RobotState::WAITING_TRAFFIC);
                 break;
             case RobotState::NAVIGATE_TO_FINISH:
-                // 中继点导航完成，检查是否到达终点
+                // 中继点导航：如果还在序列中，忽略回调（由智能切换处理）
                 if (following_waypoint_sequence_) {
-                    // 如果还在中继点序列中，不应该走到这里
-                    ROS_WARN("中继点导航异常完成，检查中继点切换逻辑");
+                    ROS_INFO("忽略中继点导航回调（由智能切换处理）");
+                    return;  // 直接返回，不处理状态转换
                 } else {
-                    // 正常到达终点
+                    // 非中继点模式下的终点导航（备用逻辑）
+                    ROS_INFO("成功到达终点: %s", current_goal_point_.c_str());
                     setState(RobotState::TASK_COMPLETE);
                 }
                 break;
@@ -1476,7 +1602,6 @@ void NavigationStateMachine::handleWaypointSwitching(const move_base_msgs::MoveB
         return;
     }
     
-    // 获取当前目标点
     std::string current_target = waypoint_sequence_[current_waypoint_index_];
     auto it = navigation_points_.find(current_target);
     if (it == navigation_points_.end()) {
@@ -1484,39 +1609,36 @@ void NavigationStateMachine::handleWaypointSwitching(const move_base_msgs::MoveB
     }
     
     geometry_msgs::Pose target_pose = it->second.pose;
-    
-    // 计算距离（使用您智能停止的相同逻辑）
     float dx = feedback->base_position.pose.position.x - target_pose.position.x;
     float dy = feedback->base_position.pose.position.y - target_pose.position.y;
     float distance = sqrt(dx*dx + dy*dy);
     
-    ROS_DEBUG_THROTTLE(2, "距离中继点[%s]: %.2fm", current_target.c_str(), distance);
+    bool should_switch = false;
     
-    // 检查是否达到切换距离
+    // 所有中继点都使用相同的宽松条件
     if (distance <= waypoint_switch_distance_) {
-        ROS_INFO("到达中继点 %s 附近，切换到下一个目标", current_target.c_str());
+        should_switch = true;
+        ROS_INFO("到达中继点 %s 附近: 距离=%.3fm", current_target.c_str(), distance);
+    }
+    
+    if (should_switch) {
+        ROS_INFO("到达中继点 %s，准备切换到下一个目标", current_target.c_str());
         
-        // 取消当前导航目标
-        action_client_.cancelAllGoals();
-        
-        // 切换到下一个中继点
-        current_waypoint_index_++;
-        
-        if (current_waypoint_index_ < waypoint_sequence_.size()) {
-            // 还有下一个中继点，立即发布新目标
-            std::string next_target = waypoint_sequence_[current_waypoint_index_];
-            ROS_INFO("切换到下一个中继点: %s", next_target.c_str());
-            
-            // 立即发送新目标，不停止
-            sendNavigationGoal(next_target);
-        } else {
-            // 序列完成
-            ROS_INFO("中继点序列完成，到达最终目标");
+        // 如果是最后一个中继点，直接完成任务，不取消导航
+        if (current_waypoint_index_ == waypoint_sequence_.size() - 1) {
+            ROS_INFO("到达最终目标 %s，任务完成", current_target.c_str());
             following_waypoint_sequence_ = false;
             task_flags_.navigation_in_progress = false;
-            
-            // 触发任务完成状态
             setState(RobotState::TASK_COMPLETE);
+        } else {
+            // 中间点：取消导航并切换到下一个
+            action_client_.cancelAllGoals();
+            ros::Duration(0.1).sleep();
+            
+            current_waypoint_index_++;
+            std::string next_target = waypoint_sequence_[current_waypoint_index_];
+            ROS_INFO("切换到下一个中继点: %s", next_target.c_str());
+            sendNavigationGoal(next_target);
         }
     }
 }
@@ -1568,8 +1690,6 @@ void NavigationStateMachine::sendNavigationGoal(const std::string& point_name) {
     }
 }
 
-// ========== 修改setState函数以记录时间 ==========
-
 void NavigationStateMachine::setState(RobotState new_state) {
     // 记录当前状态的持续时间
     ros::Time current_time = ros::Time::now();
@@ -1577,7 +1697,7 @@ void NavigationStateMachine::setState(RobotState new_state) {
     recordStateDuration(current_state_, duration);
     
     // 在关键状态转换时验证TF数据
-    if (new_state == RobotState::SCANNING_BOARDS || 
+    if (new_state == RobotState::ROTATION_SCAN || 
         new_state == RobotState::NAVIGATING_TO_BOARD) {
         
         if (!validateTFData()) {
@@ -1586,10 +1706,18 @@ void NavigationStateMachine::setState(RobotState new_state) {
         }
     }
     
-    // === 新增：当离开扫描状态时重置簇计算标志 ===
-    if (current_state_ == RobotState::SCANNING_BOARDS && 
-        new_state != RobotState::SCANNING_BOARDS) {
-        clusters_calculated_ = false;
+    // 状态转换时的清理工作
+    if (current_state_ == RobotState::ROTATION_SCAN && 
+        new_state != RobotState::ROTATION_SCAN) {
+        // 离开旋转扫描状态时停止机器人
+        geometry_msgs::Twist stop_cmd;
+        stop_cmd.angular.z = 0.0;
+        cmd_vel_pub_.publish(stop_cmd);
+        
+        // 新增：重置旋转扫描相关的检测标志
+        object_detected_during_scan_ = false;
+        detected_object_name_ = "";
+        ROS_DEBUG("重置旋转扫描检测标志");
     }
 
     ROS_INFO("状态转换: %s (%.1f 秒) -> %s", 
@@ -1823,4 +1951,69 @@ float NavigationStateMachine::calculateAdaptiveSafeDistance(const geometry_msgs:
     }
     
     return DEFAULT_SAFE_DISTANCE;
+}
+
+void NavigationStateMachine::selectBestCluster() {
+    if (detected_clusters_.empty()) {
+        current_target_cluster_ = -1;
+        return;
+    }
+    
+    // 获取当前机器人位姿
+    float current_x, current_y, current_yaw;
+    if (!getRobotPose(current_x, current_y, current_yaw)) {
+        ROS_WARN("无法获取当前位姿，使用默认选择");
+        current_target_cluster_ = 0;
+        return;
+    }
+    
+    // 基于当前朝向重新排序
+    std::vector<std::pair<size_t, float>> point_scores;
+    
+    for (size_t i = 0; i < detected_clusters_.size(); ++i) {
+        float dx_to_robot = detected_clusters_[i].x - current_x;
+        float dy_to_robot = detected_clusters_[i].y - current_y;
+        float to_point_yaw = atan2(dy_to_robot, dx_to_robot);
+        
+        // 计算与当前朝向的角度差
+        float angle_diff = fabs(to_point_yaw - current_yaw);
+        if (angle_diff > M_PI) {
+            angle_diff = 2 * M_PI - angle_diff;
+        }
+        
+        // 评分：角度差越小，评分越高
+        float direction_score = 1.0f - (angle_diff / M_PI);
+        point_scores.push_back({i, direction_score});
+        
+        ROS_INFO("识别板[%zu]方向评分: 角度差=%.1f°, 得分=%.3f", 
+                 i, angle_diff * 180 / M_PI, direction_score);
+    }
+    
+    // 按评分排序
+    std::sort(point_scores.begin(), point_scores.end(), 
+              [](const auto& a, const auto& b) { return a.second > b.second; });
+    
+    // 重新排序簇
+    std::vector<geometry_msgs::Point> sorted_clusters;
+    std::vector<ClusterInfo> sorted_infos;
+
+    for (const auto& item : point_scores) {
+        sorted_clusters.push_back(detected_clusters_[item.first]);
+        sorted_infos.push_back(detected_cluster_infos_[item.first]);
+    }
+
+    detected_clusters_ = sorted_clusters;
+    detected_cluster_infos_ = sorted_infos;
+    
+    current_target_cluster_ = 0;
+    
+    ROS_INFO("=== PCA最终选择结果 ===");
+    for (size_t i = 0; i < detected_clusters_.size(); ++i) {
+        ROS_INFO("排序[%zu]: 位置(%.2f, %.2f), 原索引=%zu", 
+                 i, detected_clusters_[i].x, detected_clusters_[i].y, 
+                 point_scores[i].first);
+    }
+    
+    ROS_INFO("选择最优识别板[0]: 位置(%.2f, %.2f)", 
+             detected_clusters_[0].x, detected_clusters_[0].y);
 }
