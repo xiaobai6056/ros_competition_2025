@@ -34,6 +34,7 @@ public:
     bool isTaskComplete() const { return current_state_ == SimulationState::OBJECT_FOUND || 
                                         current_state_ == SimulationState::ALL_ROOMS_CHECKED; }
     std::string getFoundRoom() const { return found_room_; }
+    std::string getTargetObject() const { return target_object_; }
 
 private:
     // 状态处理函数
@@ -63,6 +64,12 @@ private:
     void navFeedbackCallback(const move_base_msgs::MoveBaseFeedbackConstPtr& feedback);
     void visualCallback(const std_msgs::String::ConstPtr& msg);
     
+    // 新增：开始指令回调
+    void startCallback(const std_msgs::String::ConstPtr& msg);
+    
+    // 新增：发布结果函数
+    void publishResult(const std::string& result);
+    
     // 智能停止相关
     void handleFixedPointNavigationStop(const move_base_msgs::MoveBaseFeedbackConstPtr& feedback);
     void triggerStateTransition(const std::string& goal_name);
@@ -80,8 +87,12 @@ private:
     
     // 发布器和订阅器
     ros::Publisher tts_publisher_;
-    ros::Publisher cmd_vel_pub_;  // 添加cmd_vel发布器
+    ros::Publisher cmd_vel_pub_;
     ros::Subscriber visual_sub_;
+    
+    // 新增：开始指令订阅器和结果发布器
+    ros::Subscriber start_sub_;
+    ros::Publisher result_pub_;
     
     // TF
     tf2_ros::Buffer tf_buffer_;
@@ -94,8 +105,8 @@ private:
     std::map<std::string, geometry_msgs::PoseStamped> navigation_points_;
     std::string current_goal_point_;
     
-    // 任务相关
-    const std::string TARGET_OBJECT = "可乐";
+    // 任务相关 - 移除硬编码的目标物品
+    std::string target_object_;  // 动态目标物品
     std::string found_room_;
     std::string current_room_;
     
