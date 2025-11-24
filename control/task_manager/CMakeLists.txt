@@ -18,6 +18,7 @@ find_package(catkin REQUIRED COMPONENTS
   tf2
   tf2_ros
   tf2_geometry_msgs
+  service
 )
 
 ## System dependencies are found with CMake's conventions
@@ -96,8 +97,6 @@ find_package(catkin REQUIRED COMPONENTS
 
 ## Generate dynamic reconfigure parameters in the 'cfg' folder
 # generate_dynamic_reconfigure_options(
-#   cfg/DynReconf1.cfg
-#   cfg/DynReconf2.cfg
 # )
 
 ###################################
@@ -238,6 +237,10 @@ add_executable(new_nav_client src/new_nav_client.cpp)
 target_link_libraries(new_nav_client
   ${catkin_LIBRARIES}
 )
+
+add_executable(board_detection_navigator src/board_detection_navigator.cpp)
+target_link_libraries(board_detection_navigator ${catkin_LIBRARIES})
+
 
 add_executable(SimulationStateMachine 
     src/simulation_main.cpp 
