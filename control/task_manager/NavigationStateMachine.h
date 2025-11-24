@@ -18,6 +18,7 @@
 
 // 服务类型
 #include <std_srvs/Trigger.h>
+#include <service/Service.h>
 
 // 标准库
 #include <map>
@@ -155,6 +156,7 @@ private:
     // 服务客户端
     ros::ServiceClient qr_service_client_;       // 二维码识别服务客户端（/qr_recognition）
     ros::ServiceClient object_service_client_;   // 物体识别服务客户端（/object_recognition）
+    ros::ServiceClient simulation_service_client_;
 
     // ========== TF 相关 ==========
     tf2_ros::Buffer tf_buffer_;               // TF缓冲区
@@ -277,6 +279,7 @@ private:
     // 服务调用
     bool callQRService();
     bool callObjectRecognitionService();
+    bool callSimulationService();
 
     // TF与位姿处理
     bool getRobotPose(float& x, float& y, float& yaw);
