@@ -102,6 +102,7 @@ NavigationStateMachine::NavigationStateMachine(ros::NodeHandle& nh)
     // 初始化服务客户端
     qr_service_client_ = nh_.serviceClient<std_srvs::Trigger>("/qr_recognition");
     object_service_client_ = nh_.serviceClient<std_srvs::Trigger>("/object_recognition");
+    simulation_service_client_ = nh_.serviceClient<service::Service>("/task");
     
     // 加载导航点
     loadNavigationPoints();
@@ -584,28 +585,71 @@ void NavigationStateMachine::handleMoveToWaitZone() {
 }
 
 void NavigationStateMachine::handleWaitingSimulation() {
-    static ros::Time wait_start_time = ros::Time::now();
+    static bool first_enter = true;
+    static ros::Time wait_start_time;
+    static bool service_called = false;
+    
+    if (first_enter) {
+        ROS_INFO("[WAITING_SIMULATION] 开始通过A客户端调用B服务器仿真任务");
+        speak("正在通过A客户端启动仿真任务");
+        
+        // 发布拾取的物品到 /picked_object 话题（A客户端会订阅这个）
+        std_msgs::String object_msg;
+        object_msg.data = picked_object_;
+        ros::Publisher picked_object_pub = nh_.advertise<std_msgs::String>("/picked_object", 1, true);
+        picked_object_pub.publish(object_msg);
+        ROS_INFO("已发布拾取物品到 /picked_object: %s", picked_object_.c_str());
+        
+        wait_start_time = ros::Time::now();
+        service_called = false;
+        first_enter = false;
+        
+        // 等待一下确保A客户端收到消息
+        ros::Duration(0.5).sleep();
+        return;
+    }
     
     // 时间统计
     double wait_time = (ros::Time::now() - wait_start_time).toSec();
-    ROS_INFO_THROTTLE(2, "[WAITING_SIMULATION] 等待仿真结果... 已等待: %.1f 秒", wait_time);
+    ROS_INFO_THROTTLE(2, "[WAITING_SIMULATION] 等待A客户端返回B服务器结果... 已等待: %.1f 秒", wait_time);
     
-    if (task_flags_.simulation_received) {
-        ROS_INFO("[WAITING_SIMULATION] 收到仿真结果: %s", simulation_result_.c_str());
-        speak("仿真任务已完成，目标货物位于" + simulation_result_ + "房间");
-        task_flags_.simulation_received = false;
-        setState(RobotState::MOVE_TO_TRAFFIC_ZONE);
-        wait_start_time = ros::Time::now(); // 重置计时器
-    } else {
-        // 开发调试模式：如果等待超过5秒，使用模拟数据继续
-        if (wait_time > 5.0) {
-            ROS_WARN("[WAITING_SIMULATION] 仿真结果未收到，等待 %.1f 秒后使用模拟数据继续测试", wait_time);
-            simulation_result_ = "A101"; // 模拟结果
-            speak("仿真任务已完成，目标货物位于" + simulation_result_ + "房间");
-            setState(RobotState::MOVE_TO_TRAFFIC_ZONE);
-            wait_start_time = ros::Time::now(); // 重置计时器
-            return;
+    if (!service_called) {
+        // 调用A客户端服务
+        ROS_INFO("[WAITING_SIMULATION] 调用A客户端 /task 服务");
+        
+        if (callSimulationService()) {
+            service_called = true;
+            ROS_INFO("A客户端服务调用成功，等待B服务器返回结果");
+        } else {
+            ROS_WARN("A客户端服务调用失败，1秒后重试");
+            ros::Duration(1.0).sleep();
         }
+    } else {
+        // 服务已调用，等待A客户端返回B服务器的结果
+        if (task_flags_.simulation_received) {
+            ROS_INFO("[WAITING_SIMULATION] 收到A客户端返回的B服务器结果: %s", simulation_result_.c_str());
+            speak("仿真任务已完成，目标货物位于" + simulation_result_ + "房间");
+            
+            // 重置状态
+            task_flags_.simulation_received = false;
+            service_called = false;
+            first_enter = true;
+            
+            setState(RobotState::MOVE_TO_TRAFFIC_ZONE);
+        }
+    }
+    
+    // 超时处理
+    if (wait_time > 60.0) {
+        ROS_WARN("[WAITING_SIMULATION] A客户端响应超时，使用模拟数据继续");
+        simulation_result_ = "A101";
+        speak("仿真任务超时，使用默认路径继续");
+        
+        service_called = false;
+        first_enter = true;
+        task_flags_.simulation_received = false;
+        
+        setState(RobotState::MOVE_TO_TRAFFIC_ZONE);
     }
 }
 
@@ -2016,4 +2060,36 @@ void NavigationStateMachine::selectBestCluster() {
     
     ROS_INFO("选择最优识别板[0]: 位置(%.2f, %.2f)", 
              detected_clusters_[0].x, detected_clusters_[0].y);
+}
+
+bool NavigationStateMachine::callSimulationService() {
+    try {
+        // 创建服务请求
+        service::Service srv;
+        
+        // 设置请求参数
+        srv.request.target_object = picked_object_;
+        
+        ROS_INFO("调用A客户端 /task 服务，目标物品: %s", picked_object_.c_str());
+        
+        // 调用服务
+        if (simulation_service_client_.call(srv)) {
+            if (srv.response.success) {
+                simulation_result_ = srv.response.result;
+                task_flags_.simulation_received = true;
+                ROS_INFO("A客户端返回B服务器结果: %s", simulation_result_.c_str());
+                return true;
+            } else {
+                ROS_WARN("A客户端返回失败: %s", srv.response.result.c_str());
+                return false;
+            }
+        } else {
+            ROS_WARN("调用A客户端服务失败");
+            return false;
+        }
+    }
+    catch (const std::exception& e) {
+        ROS_ERROR("调用A客户端异常: %s", e.what());
+        return false;
+    }
 }
