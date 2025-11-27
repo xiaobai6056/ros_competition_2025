@@ -226,7 +226,7 @@ void NavigationStateMachine::handleRotationScan() {
             ROS_WARN("视觉重置服务异常: %s", e.what());
         }
         
-         ros::Duration(0.5).sleep();
+         ros::Duration(1.0).sleep();
 
         // === 重置状态标志 ===
         rotation_scan_complete_ = false;
@@ -277,7 +277,7 @@ void NavigationStateMachine::handleRotationScan() {
         rotation_active = false;
         
         // 等待机器人稳定
-        ros::Duration(0.5).sleep();
+        ros::Duration(1.0).sleep();
         
         // 使用当前收集的数据进行PCA计算
         ROS_INFO("使用已收集的 %zu 帧激光数据进行PCA定位", cached_laser_scans_.size());
@@ -643,37 +643,6 @@ void NavigationStateMachine::handleMoveToTrafficZone() {
     ROS_INFO_THROTTLE(2, "[MOVE_TO_TRAFFIC_ZONE] 等待导航完成... 已耗时: %.1f 秒", time_in_state);
 }
 
-// void NavigationStateMachine::handleWaitingTraffic() {
-//     static bool first_enter = true;
-    
-//     if (first_enter) {
-//         ROS_INFO("[WAITING_TRAFFIC] 开始等待交通灯识别");
-//         speak("等待交通灯识别");
-//         first_enter = false;
-//         return;
-//     }
-    
-//     // 时间统计
-//     double time_in_state = (ros::Time::now() - state_start_time_).toSec();
-//     ROS_INFO_THROTTLE(2, "[WAITING_TRAFFIC] 等待中... 已耗时: %.1f 秒", time_in_state);
-    
-//     if (task_flags_.traffic_received) {
-//         // 收到有效结果（A或B）立即处理
-//         if (traffic_result_ == "A" || traffic_result_ == "B") {
-//             ROS_INFO("[WAITING_TRAFFIC] 收到有效路牌识别结果: %s", traffic_result_.c_str());
-//             speak("路口" + traffic_result_ + "可通过");
-//             task_flags_.traffic_received = false;
-//             first_enter = true;
-//             setState(RobotState::NAVIGATE_TO_FINISH);
-//         } 
-//         // 收到unknown，清除标志继续等待下一个结果
-//         else if (traffic_result_ == "unknown") {
-//             ROS_INFO_THROTTLE(1, "[WAITING_TRAFFIC] 收到未知结果，继续等待...");
-//             task_flags_.traffic_received = false;
-//             // 不清除first_enter，继续等待有效结果
-//         }
-//     }
-// }
 
 void NavigationStateMachine::handleWaitingTraffic() {
     static ros::Time traffic_wait_start_time;
