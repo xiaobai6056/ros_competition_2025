@@ -23,6 +23,7 @@ enum class SimulationState {
     MOVE_TO_ROOM_C,
     WAITING_VISUAL_C,
     OBJECT_FOUND,
+    RETURN_TO_ORIGIN,
     ALL_ROOMS_CHECKED,
     ERROR
 };
@@ -34,7 +35,8 @@ public:
     bool isTaskComplete() const { return current_state_ == SimulationState::OBJECT_FOUND || 
                                         current_state_ == SimulationState::ALL_ROOMS_CHECKED; }
     std::string getFoundRoom() const { return found_room_; }
-    std::string getTargetObject() const { return target_object_; }
+    std::string getTargetTask() const { return target_task_; }
+    std::string getFoundObject() const { return found_object_; }
 
 private:
     // 状态处理函数
@@ -46,6 +48,7 @@ private:
     void handleMoveToRoomC();
     void handleWaitingVisualC();
     void handleObjectFound();
+    void handleReturnToOrigin();
     void handleAllRoomsChecked();
     void handleErrorState();
 
@@ -62,13 +65,14 @@ private:
                         const move_base_msgs::MoveBaseResultConstPtr& result);
     void navActiveCallback();
     void navFeedbackCallback(const move_base_msgs::MoveBaseFeedbackConstPtr& feedback);
-    void visualCallback(const std_msgs::String::ConstPtr& msg);
+    void visualCallback(const std_msgs::String::ConstPtr& msg);  // 修正：使用std_msgs
     
-    // 新增：开始指令回调
+    // 开始指令回调
     void startCallback(const std_msgs::String::ConstPtr& msg);
     
-    // 新增：发布结果函数
+    // 发布结果函数
     void publishResult(const std::string& result);
+    void publishFinalResult();
     
     // 智能停止相关
     void handleFixedPointNavigationStop(const move_base_msgs::MoveBaseFeedbackConstPtr& feedback);
@@ -78,9 +82,15 @@ private:
     // 导航相关
     geometry_msgs::PoseStamped createPose(double x, double y, double yaw);
     void loadNavigationPoints();
+    
+    // 保存和返回原点功能
+    void saveOriginalPose();
+    bool getRobotPose(float& x, float& y, float& yaw);
+    void resetStateMachine();
 
     ros::NodeHandle& nh_;
     SimulationState current_state_;
+    ros::Time state_start_time_;
     
     // Action client
     actionlib::SimpleActionClient<move_base_msgs::MoveBaseAction> action_client_;
@@ -90,7 +100,7 @@ private:
     ros::Publisher cmd_vel_pub_;
     ros::Subscriber visual_sub_;
     
-    // 新增：开始指令订阅器和结果发布器
+    // 开始指令订阅器和结果发布器
     ros::Subscriber start_sub_;
     ros::Publisher result_pub_;
     
@@ -105,15 +115,15 @@ private:
     std::map<std::string, geometry_msgs::PoseStamped> navigation_points_;
     std::string current_goal_point_;
     
-    // 任务相关 - 移除硬编码的目标物品
-    std::string target_object_;  // 动态目标物品
+    // 任务相关
+    std::string target_task_;
     std::string found_room_;
+    std::string found_object_;
     std::string current_room_;
     
     // 视觉识别相关
     bool visual_service_called_;
-    ros::Time visual_start_time_;
-    static constexpr int VISUAL_TIMEOUT = 3;
+    static constexpr int VISUAL_TIMEOUT = 15;
     
     // 房间检查状态
     bool room_a_checked_;
@@ -123,9 +133,13 @@ private:
     // 智能停止相关
     bool navigation_in_progress_;
     
+    // 原点相关
+    geometry_msgs::PoseStamped original_pose_;
+    bool original_pose_saved_;
+    
     // 智能停止阈值
-    static constexpr float DISTANCE_THRESHOLD = 0.15f;
-    static constexpr float YAW_THRESHOLD = 0.25f;
+    static constexpr float DISTANCE_THRESHOLD = 0.18f;
+    static constexpr float YAW_THRESHOLD = 0.2f;
 };
 
 #endif
