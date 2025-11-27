@@ -65,6 +65,10 @@ class ObjectDetector:
         self.published_objects_topic = {}  # 改为字典，存储对象名和发布时间戳
         self.max_history_size = 10  # 最大历史记录数量
         
+        # 新增：重置状态管理
+        self.resetting = False
+        self.skip_frames_count = 0
+        
         # 订阅当前任务类型
         self.task_sub = rospy.Subscriber("/current_task", String, self.task_callback)
         
@@ -82,8 +86,8 @@ class ObjectDetector:
             3: ("食品", "蛋糕"),
             4: ("食品", "牛奶"),
             5: ("食品", "可乐"),
-            6: ("蔬菜", "土豆"),
-            7: ("蔬菜", "番茄"),
+            6: ("蔬菜", "番茄"),
+            7: ("蔬菜", "土豆"),
             8: ("蔬菜", "辣椒"),
         }
         
@@ -93,7 +97,7 @@ class ObjectDetector:
         # 订阅摄像头图像
         rospy.Subscriber("/detect/raw_image", Image, self.image_callback, queue_size=1)
         
-        rospy.loginfo("物体识别节点启动完成 - YOLOv11智能评分模式 + 异步重置机制")
+        rospy.loginfo("物体识别节点启动完成 - YOLOv11智能评分模式 + 跳帧重置机制")
 
     def load_model(self):
         """加载模型 - 使用YOLO11官方API"""
@@ -136,7 +140,17 @@ class ObjectDetector:
         rospy.loginfo("任务类型更新: {}".format(self.current_task))
 
     def image_callback(self, msg):
-        """图像回调"""
+        """图像回调 - 添加跳帧处理"""
+        # 跳帧处理：重置后跳过指定数量的帧
+        if self.resetting and self.skip_frames_count > 0:
+            self.skip_frames_count -= 1
+            rospy.logdebug("🚫 跳帧处理: 跳过当前帧，剩余%d帧", self.skip_frames_count)
+            return
+        elif self.resetting and self.skip_frames_count == 0:
+            # 跳帧完成，清除重置标志
+            self.resetting = False
+            rospy.loginfo("✅ 跳帧完成，开始正常图像处理")
+        
         try:
             cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
             self.frame_counter += 1
@@ -282,7 +296,7 @@ class ObjectDetector:
                 best_detection = detection
         
         # 只有评分达到阈值才发布
-        if best_score >= 0.5:  # 可调整的发布阈值
+        if best_score >= 0.6:  # 可调整的发布阈值
             return best_detection
         else:
             rospy.logdebug("最佳检测评分 {:.3f} 低于阈值，不发布".format(best_score))
@@ -374,7 +388,7 @@ class ObjectDetector:
                     obj_name, category, count, max_conf))
                 
                 # 关键修改：严格符合状态机要求
-                if count >= 1 and max_conf >= 0.6:  # 只要有1次高置信度检测即可
+                if count >= 1 and max_conf >= 0.8:  # 只要有1次高置信度检测即可
                     if self.current_task and category != self.current_task:
                         response.message = "WARN:" + obj_name
                         rospy.logwarn("任务不匹配: 需要 {}, 检测到 {}".format(self.current_task, category))
@@ -410,11 +424,15 @@ class ObjectDetector:
             rospy.loginfo("=== 服务处理完成 ===")
 
     def handle_reset_service(self, req):
-        """重置服务 - 清空所有历史数据并发布完成信号"""
+        """重置服务 - 清空所有历史数据并添加跳帧处理"""
         rospy.loginfo("=== 收到重置请求，开始清空视觉历史数据 ===")
         
         try:
-            # 清空所有状态
+            # 第一步：设置重置标志，开始跳帧处理
+            self.resetting = True
+            self.skip_frames_count = 8  # 跳过5帧图像处理
+            
+            # 第二步：清空所有状态
             self.session_active = False
             self.detection_history.clear()  # 清空检测历史
             self.published_objects_topic.clear()  # 清空话题发布历史
@@ -423,17 +441,20 @@ class ObjectDetector:
             
             # 重要：保持实时检测能力，不重置模型状态
             
-            # 发布空检测信号
+            # 第三步：发布空检测信号
             self.publish_object_detected("")
             
-            # 新增：发布重置完成信号
+            # 关键修改：添加处理延迟，确保跳帧标志生效
+            rospy.sleep(0.5)  # 等待100ms，确保跳帧标志在图像回调前生效
+            
+            # 第四步：发布重置完成信号
             self.reset_complete_pub.publish("reset_complete")
             
             response = TriggerResponse()
             response.success = True
-            response.message = "视觉历史数据和发布记录已完全清空"
+            response.message = f"视觉历史数据已清空，将跳过{self.skip_frames_count}帧图像"
             
-            rospy.loginfo("✅ 视觉状态完全重置完成，已发送完成信号")
+            rospy.loginfo("✅ 视觉状态重置完成，将跳过%d帧图像处理", self.skip_frames_count)
             return response
             
         except Exception as e:
