@@ -212,38 +212,32 @@ void NavigationStateMachine::handleRotationScan() {
         ROS_INFO("[ROTATION_SCAN] 开始旋转扫描寻找目标物体");
         speak("开始扫描寻找目标物体");
         
-        // === 新增：旋转前重置视觉状态 ===
+        // === 重置视觉状态 ===
         try {
             std_srvs::Trigger reset_srv;
             ros::ServiceClient reset_client = nh_.serviceClient<std_srvs::Trigger>("/reset_vision_state");
             
             if (reset_client.waitForExistence(ros::Duration(1.0))) {
                 if (reset_client.call(reset_srv)) {
-                    if (reset_srv.response.success) {
-                        ROS_INFO("旋转前视觉状态重置成功: %s", reset_srv.response.message.c_str());
-                    } else {
-                        ROS_WARN("旋转前视觉状态重置失败: %s", reset_srv.response.message.c_str());
-                    }
-                } else {
-                    ROS_WARN("旋转前视觉重置服务调用失败");
+                    ROS_INFO("旋转前视觉状态重置: %s", reset_srv.response.message.c_str());
                 }
-            } else {
-                ROS_WARN("旋转前视觉重置服务不可用，继续执行");
             }
         } catch (const std::exception& e) {
-            ROS_WARN("旋转前视觉重置服务异常: %s", e.what());
+            ROS_WARN("视觉重置服务异常: %s", e.what());
         }
         
-        // 重置状态标志（原有逻辑保持不变）
+         ros::Duration(0.5).sleep();
+
+        // === 重置状态标志 ===
         rotation_scan_complete_ = false;
         pca_calculation_complete_ = false;
         cached_laser_scans_.clear();
         current_rotated_angle_ = 0.0f;
-        object_detected_during_scan_ = false;  // 明确重置
-        detected_object_name_ = "";           // 明确重置
+        object_detected_during_scan_ = false;
+        detected_object_name_ = "";
         rotation_active = true;
         
-        // 获取初始位姿
+        // === 获取初始位姿 ===
         if (!getRobotPose(scan_robot_x_, scan_robot_y_, scan_robot_yaw_)) {
             ROS_WARN("无法获取机器人位姿，延迟扫描");
             return;
@@ -252,18 +246,26 @@ void NavigationStateMachine::handleRotationScan() {
         rotation_start_yaw = scan_robot_yaw_;
         rotation_start_time = ros::Time::now();
         
-        // 开始旋转
+        // === 开始旋转 ===
         geometry_msgs::Twist rotate_cmd;
         rotate_cmd.angular.z = 0.6f; 
         cmd_vel_pub_.publish(rotate_cmd);
         
         ROS_INFO("旋转扫描开始，等待视觉识别目标物体...");
         ROS_INFO("当前任务目标: %s", current_task_.c_str());
+        
         first_enter = false;
-        return;
+        // 重要：不return，继续执行下面的视觉检查逻辑
     }
     
-    // === 关键修改：持续检查视觉识别结果 ===
+    // === 持续发布旋转命令，确保机器人持续旋转 ===
+    if (rotation_active) {
+        geometry_msgs::Twist rotate_cmd;
+        rotate_cmd.angular.z = 0.6f;
+        cmd_vel_pub_.publish(rotate_cmd);
+    }
+    
+    // === 检查视觉识别结果（第一次进入就会检查）===
     if (object_detected_during_scan_ && !detected_object_name_.empty()) {
         ROS_INFO("🎯 检测到目标物体: %s，立即停止旋转", detected_object_name_.c_str());
         speak("发现目标" + detected_object_name_);
@@ -288,18 +290,10 @@ void NavigationStateMachine::handleRotationScan() {
             setState(RobotState::CLUSTER_SELECTION);
         }
         
-        first_enter = true;
-        return;  // 重要：立即返回，不再执行后续旋转逻辑
+        return;
     }
     
-    // 持续发布旋转命令，确保机器人持续旋转
-    if (rotation_active) {
-        geometry_msgs::Twist rotate_cmd;
-        rotate_cmd.angular.z = 0.6f;
-        cmd_vel_pub_.publish(rotate_cmd);
-    }
-    
-    // 更新当前旋转角度（用于超时判断）
+    // === 更新当前旋转角度（用于超时判断）===
     float current_x, current_y, current_yaw;
     if (getRobotPose(current_x, current_y, current_yaw)) {
         current_rotated_angle_ = fabs(current_yaw - rotation_start_yaw);
@@ -308,7 +302,7 @@ void NavigationStateMachine::handleRotationScan() {
         }
     }
     
-    // 时间统计和超时处理
+    // === 时间统计和超时处理 ===
     double rotation_time = (ros::Time::now() - rotation_start_time).toSec();
     ROS_INFO_THROTTLE(1, "[ROTATION_SCAN] 旋转中... 进度: %.1f°, 耗时: %.1f秒, 等待目标: %s", 
                      current_rotated_angle_ * 180 / M_PI, rotation_time, current_task_.c_str());
@@ -340,8 +334,6 @@ void NavigationStateMachine::handleRotationScan() {
         } else {
             setState(RobotState::CLUSTER_SELECTION);
         }
-        
-        first_enter = true;
     }
 }
 
@@ -562,7 +554,6 @@ void NavigationStateMachine::handleObjectConfirmed() {
     ROS_INFO("[OBJECT_CONFIRMED] 物体确认: %s", picked_object_.c_str());
     speak("我已取到" + picked_object_);
     task_flags_.object_picked = true;
-    updateCostCalculation(picked_object_);
     
     moving_to_cluster_ = false;
     current_target_cluster_ = -1;
@@ -587,13 +578,17 @@ void NavigationStateMachine::handleMoveToWaitZone() {
 void NavigationStateMachine::handleWaitingSimulation() {
     static bool first_enter = true;
     static ros::Time wait_start_time;
-    static bool service_called = false;
     
     if (first_enter) {
-        ROS_INFO("[WAITING_SIMULATION] 开始通过A客户端调用B服务器仿真任务");
-        speak("正在通过A客户端启动仿真任务");
+        ROS_INFO("[WAITING_SIMULATION] 发布拾取物品，等待A客户端处理");
+        speak("等待仿真任务完成");
         
-        // 发布拾取的物品到 /picked_object 话题（A客户端会订阅这个）
+        // ✅ 发布任务类型和拾取物品
+        std_msgs::String task_msg;
+        task_msg.data = current_task_;
+        task_pub_.publish(task_msg);
+        ROS_INFO("已发布任务类型到 /current_task: %s", current_task_.c_str());
+        
         std_msgs::String object_msg;
         object_msg.data = picked_object_;
         ros::Publisher picked_object_pub = nh_.advertise<std_msgs::String>("/picked_object", 1, true);
@@ -601,54 +596,36 @@ void NavigationStateMachine::handleWaitingSimulation() {
         ROS_INFO("已发布拾取物品到 /picked_object: %s", picked_object_.c_str());
         
         wait_start_time = ros::Time::now();
-        service_called = false;
         first_enter = false;
-        
-        // 等待一下确保A客户端收到消息
-        ros::Duration(0.5).sleep();
         return;
     }
     
-    // 时间统计
+    // ✅ 等待A客户端调用B服务返回结果
     double wait_time = (ros::Time::now() - wait_start_time).toSec();
     ROS_INFO_THROTTLE(2, "[WAITING_SIMULATION] 等待A客户端返回B服务器结果... 已等待: %.1f 秒", wait_time);
     
-    if (!service_called) {
-        // 调用A客户端服务
-        ROS_INFO("[WAITING_SIMULATION] 调用A客户端 /task 服务");
+    if (task_flags_.simulation_received) {
+        ROS_INFO("[WAITING_SIMULATION] 收到仿真结果: %s", simulation_result_.c_str());
         
-        if (callSimulationService()) {
-            service_called = true;
-            ROS_INFO("A客户端服务调用成功，等待B服务器返回结果");
-        } else {
-            ROS_WARN("A客户端服务调用失败，1秒后重试");
-            ros::Duration(1.0).sleep();
-        }
-    } else {
-        // 服务已调用，等待A客户端返回B服务器的结果
-        if (task_flags_.simulation_received) {
-            ROS_INFO("[WAITING_SIMULATION] 收到A客户端返回的B服务器结果: %s", simulation_result_.c_str());
-            speak("仿真任务已完成，目标货物位于" + simulation_result_ + "房间");
-            
-            // 重置状态
-            task_flags_.simulation_received = false;
-            service_called = false;
-            first_enter = true;
-            
-            setState(RobotState::MOVE_TO_TRAFFIC_ZONE);
-        }
+        // 修改：代价计算已经在callSimulationService中完成，这里只需要语音播报
+        speak("仿真任务已完成，目标货物位于" + simulation_result_ + "房间");
+        
+        first_enter = true;
+        setState(RobotState::MOVE_TO_TRAFFIC_ZONE);
     }
     
     // 超时处理
-    if (wait_time > 60.0) {
+    if (wait_time > 5.0) { // 增加到30秒超时
         ROS_WARN("[WAITING_SIMULATION] A客户端响应超时，使用模拟数据继续");
         simulation_result_ = "A101";
+        
+        // 修改：超时情况下也计算代价
+        updateCostCalculation(picked_object_, simulation_result_);
+        
         speak("仿真任务超时，使用默认路径继续");
         
-        service_called = false;
         first_enter = true;
         task_flags_.simulation_received = false;
-        
         setState(RobotState::MOVE_TO_TRAFFIC_ZONE);
     }
 }
@@ -665,6 +642,38 @@ void NavigationStateMachine::handleMoveToTrafficZone() {
     double time_in_state = (ros::Time::now() - state_start_time_).toSec();
     ROS_INFO_THROTTLE(2, "[MOVE_TO_TRAFFIC_ZONE] 等待导航完成... 已耗时: %.1f 秒", time_in_state);
 }
+
+// void NavigationStateMachine::handleWaitingTraffic() {
+//     static bool first_enter = true;
+    
+//     if (first_enter) {
+//         ROS_INFO("[WAITING_TRAFFIC] 开始等待交通灯识别");
+//         speak("等待交通灯识别");
+//         first_enter = false;
+//         return;
+//     }
+    
+//     // 时间统计
+//     double time_in_state = (ros::Time::now() - state_start_time_).toSec();
+//     ROS_INFO_THROTTLE(2, "[WAITING_TRAFFIC] 等待中... 已耗时: %.1f 秒", time_in_state);
+    
+//     if (task_flags_.traffic_received) {
+//         // 收到有效结果（A或B）立即处理
+//         if (traffic_result_ == "A" || traffic_result_ == "B") {
+//             ROS_INFO("[WAITING_TRAFFIC] 收到有效路牌识别结果: %s", traffic_result_.c_str());
+//             speak("路口" + traffic_result_ + "可通过");
+//             task_flags_.traffic_received = false;
+//             first_enter = true;
+//             setState(RobotState::NAVIGATE_TO_FINISH);
+//         } 
+//         // 收到unknown，清除标志继续等待下一个结果
+//         else if (traffic_result_ == "unknown") {
+//             ROS_INFO_THROTTLE(1, "[WAITING_TRAFFIC] 收到未知结果，继续等待...");
+//             task_flags_.traffic_received = false;
+//             // 不清除first_enter，继续等待有效结果
+//         }
+//     }
+// }
 
 void NavigationStateMachine::handleWaitingTraffic() {
     static ros::Time traffic_wait_start_time;
@@ -758,9 +767,20 @@ void NavigationStateMachine::handleTaskComplete() {
     
     if (!task_complete_announced) {
         ROS_INFO("[TASK_COMPLETE] 任务完成");
-        speak("我已完成货物采购任务，本次采购货物为" + picked_object_ + "，总计花费15元，需找零5元");
         
-        // 延迟一下再输出时间统计，确保所有状态时间都记录完成
+        // 机器人默认携带20元
+        double payment = 20.0;
+        double change = payment - total_cost_;
+        
+        // 生成采购报告
+        std::string purchase_report = generatePurchaseReport(payment, change);
+        
+        speak("我已完成货物采购任务，" + purchase_report);
+        
+        // 输出详细采购信息到日志
+        printPurchaseDetails(payment, change);
+        
+        // 延迟一下再输出时间统计
         ros::Duration(1.0).sleep();
         
         // 输出总时间统计
@@ -1799,25 +1819,49 @@ geometry_msgs::PoseStamped NavigationStateMachine::createPose(double x, double y
     return pose;
 }
 
-void NavigationStateMachine::updateCostCalculation(const std::string& object) {
-    ROS_INFO("[占位] 更新价格信息: %s", object.c_str());
+void NavigationStateMachine::updateCostCalculation(const std::string& object, const std::string& simulation_result) {
+    ROS_INFO("=== 更新价格计算 ===");
+    ROS_INFO("拾取物品: %s", object.c_str());
+    ROS_INFO("仿真结果: %s", simulation_result.c_str());
     
+    // 物品价格（根据您提供的信息）
     std::map<std::string, double> price_map = {
-        {"苹果", 5.0},
-        {"香蕉", 3.0},
-        {"西红柿", 4.0},
+        {"苹果", 4.0},
+        {"香蕉", 2.0},
+        {"西瓜", 5.0},
+        {"辣椒", 2.0},
+        {"番茄", 5.0},  // 西红柿
+        {"土豆", 2.0},
+        {"牛奶", 5.0},
+        {"蛋糕", 10.0},
         {"可乐", 3.0}
     };
     
-    auto it = price_map.find(object);
-    if (it != price_map.end()) {
-        total_cost_ += it->second;
-        ROS_INFO("[占位] 物品 %s 价格 %.1f 元，当前总价: %.1f 元", 
-                object.c_str(), it->second, total_cost_);
+    // 计算物品价格
+    double item_price = 5.0; // 默认价格
+    auto price_it = price_map.find(object);
+    if (price_it != price_map.end()) {
+        item_price = price_it->second;
+        ROS_INFO("找到物品 %s 的价格: %.1f 元", object.c_str(), item_price);
     } else {
-        total_cost_ += 5.0;
-        ROS_WARN("[占位] 使用默认价格 5.0 元");
+        ROS_WARN("物品 %s 不在价格表中，使用默认价格 5.0 元", object.c_str());
     }
+    
+    // 累计总价
+    total_cost_ += item_price;
+    
+    ROS_INFO("价格明细:");
+    ROS_INFO("  ├─ 物品价格: %.1f 元", item_price);
+    ROS_INFO("  └─ 当前累计总价: %.1f 元", total_cost_);
+    
+    // 记录采购历史
+    PurchaseRecord record;
+    record.object = object;
+    record.room = simulation_result;
+    record.price = item_price;
+    purchase_history_.push_back(record);
+    
+    ROS_INFO("=== 价格计算完成 ===");
 }
 
 bool NavigationStateMachine::getRobotPose(float& x, float& y, float& yaw) {
@@ -2067,10 +2111,10 @@ bool NavigationStateMachine::callSimulationService() {
         // 创建服务请求
         service::Service srv;
         
-        // 设置请求参数
-        srv.request.target_object = picked_object_;
+        // 修改：使用 task_type 而不是 target_object
+        srv.request.task_type = current_task_;  // 使用任务类型而不是物品
         
-        ROS_INFO("调用A客户端 /task 服务，目标物品: %s", picked_object_.c_str());
+        ROS_INFO("调用A客户端 /task 服务，任务类型: %s", current_task_.c_str());
         
         // 调用服务
         if (simulation_service_client_.call(srv)) {
@@ -2078,6 +2122,10 @@ bool NavigationStateMachine::callSimulationService() {
                 simulation_result_ = srv.response.result;
                 task_flags_.simulation_received = true;
                 ROS_INFO("A客户端返回B服务器结果: %s", simulation_result_.c_str());
+                
+                // 修改：在这里更新代价计算，使用实际的仿真结果
+                updateCostCalculation(picked_object_, simulation_result_);
+                
                 return true;
             } else {
                 ROS_WARN("A客户端返回失败: %s", srv.response.result.c_str());
@@ -2093,3 +2141,44 @@ bool NavigationStateMachine::callSimulationService() {
         return false;
     }
 }
+
+std::string NavigationStateMachine::generatePurchaseReport(double payment, double change) {
+    std::stringstream report;
+    
+    report << "本次采购货物为" << picked_object_;
+    report << "，价格" << getItemPrice(picked_object_) << "元";
+    report << "，总计花费" << total_cost_ << "元";
+    report << "，支付20元";
+    report << "，需找零" << change << "元";
+    
+    return report.str();
+}
+
+double NavigationStateMachine::getItemPrice(const std::string& object) {
+    std::map<std::string, double> price_map = {
+        {"苹果", 4.0}, {"香蕉", 2.0}, {"西瓜", 5.0}, {"辣椒", 2.0},
+        {"番茄", 5.0}, {"土豆", 2.0}, {"牛奶", 5.0}, {"蛋糕", 10.0}, {"可乐", 3.0}
+    };
+    
+    auto it = price_map.find(object);
+    return (it != price_map.end()) ? it->second : 5.0;
+}
+
+void NavigationStateMachine::printPurchaseDetails(double payment, double change) {
+    ROS_INFO("========== 采购详情 ==========");
+    ROS_INFO("采购物品: %s", picked_object_.c_str());
+    ROS_INFO("物品价格: %.1f 元", getItemPrice(picked_object_));
+    ROS_INFO("总计花费: %.1f 元", total_cost_);
+    ROS_INFO("支付金额: %.1f 元", payment);
+    ROS_INFO("找零金额: %.1f 元", change);
+    
+    if (!purchase_history_.empty()) {
+        ROS_INFO("采购记录:");
+        for (const auto& record : purchase_history_) {
+            ROS_INFO("  - %s: %.1f元 (位置:%s)",
+                    record.object.c_str(), record.price, record.room.c_str());
+        }
+    }
+    ROS_INFO("==============================");
+}
+
