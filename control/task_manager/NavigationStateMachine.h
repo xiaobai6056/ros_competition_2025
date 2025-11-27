@@ -26,6 +26,7 @@
 #include <vector>
 #include <cmath>
 #include <sstream>
+#include <deque>
 
 /**
  * @brief PCA结果结构体
@@ -39,6 +40,15 @@ struct PCAResult {
     geometry_msgs::Point end_point;    // 投影终点
     
     PCAResult() : length(0.0f), orientation(0.0f), confidence(0.0f) {}
+};
+
+/**
+ * @brief 采购记录结构体
+ */
+struct PurchaseRecord {
+    std::string object;     // 物品名称
+    std::string room;       // 所在房间
+    double price;           // 物品价格
 };
 
 /**
@@ -152,6 +162,7 @@ private:
     ros::Subscriber traffic_sub_;        // 路牌识别结果订阅器（/demo/traffic_result）
     ros::Subscriber costmap_sub_;        // 代价地图订阅器（/move_base/global_costmap/costmap）
     ros::Subscriber object_detected_sub_; // 新增：物体检测信号订阅器（/object_detected）
+    ros::Subscriber vision_reset_sub_;
 
     // 服务客户端
     ros::ServiceClient qr_service_client_;       // 二维码识别服务客户端（/qr_recognition）
@@ -173,6 +184,9 @@ private:
     std::string traffic_result_;              // 路牌识别结果（可通过路口）
     std::string current_goal_point_;          // 当前导航目标点名称
     double total_cost_ = 0.0;                 // 任务总花费
+    
+    // 新增：采购历史记录
+    std::vector<PurchaseRecord> purchase_history_;  // 采购历史记录
     
     // 新增：物体检测相关
     bool object_detected_during_scan_ = false;  // 扫描过程中是否检测到目标物体
@@ -221,6 +235,11 @@ private:
     size_t max_cached_scans_ = 5;                          // 最大缓存帧数
     float rotation_target_angle_ = M_PI;                   // 旋转目标角度（180度）
     float current_rotated_angle_ = 0.0f;                   // 当前已旋转角度
+
+    // ========== 时间统计相关 ==========
+    ros::Time state_start_time_;
+    std::map<int, double> state_durations_; // 状态编号 -> 持续时间
+    ros::Time cluster_nav_start_time_;
 
     // ========== 私有方法声明 ==========
     
@@ -294,22 +313,25 @@ private:
     void setState(RobotState new_state);
     geometry_msgs::PoseStamped createPose(double x, double y, double yaw);
     void loadNavigationPoints();  // 加载预定义导航点
-    void updateCostCalculation(const std::string& object);  // 更新任务花费
+    
+    // 修改后的代价计算函数
+    void updateCostCalculation(const std::string& object, const std::string& simulation_result);
+    
+    // 采购相关函数
+    std::string generatePurchaseReport(double payment, double change);
+    double getItemPrice(const std::string& object);
+    void printPurchaseDetails(double payment, double change);
 
     // 数据回调
     void objectDetectedCallback(const std_msgs::String::ConstPtr& msg);  // 物体检测回调
     void simulationCallback(const std_msgs::String::ConstPtr& msg);
     void trafficCallback(const std_msgs::String::ConstPtr& msg);
 
-    // 时间统计相关
-    ros::Time state_start_time_;
-    std::map<int, double> state_durations_; // 状态编号 -> 持续时间
-    ros::Time cluster_nav_start_time_;
-    
     // 时间统计函数
     void recordStateDuration(RobotState state, double duration);
     void printTimeStatistics();
     const char* getStateName(RobotState state);
+
 };
 
 #endif  // NAVIGATION_STATE_MACHINE_H
