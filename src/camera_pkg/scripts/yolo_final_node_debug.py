@@ -41,6 +41,9 @@ class ObjectDetector:
         # 物体检测信号发布
         self.object_detected_pub = rospy.Publisher("/object_detected", String, queue_size=1)
         
+        # 新增：重置完成信号发布
+        self.reset_complete_pub = rospy.Publisher("/vision_reset_complete", String, queue_size=1)
+        
         # 配置参数
         self.config = {
             'min_confidence': 0.40,
@@ -57,6 +60,10 @@ class ObjectDetector:
         self.service_called = False
         self.frame_counter = 0
         self.last_publish_time = 0  # 发布频率控制
+        
+        # 新增：话题发布历史记录（带时间戳的智能清理）
+        self.published_objects_topic = {}  # 改为字典，存储对象名和发布时间戳
+        self.max_history_size = 10  # 最大历史记录数量
         
         # 订阅当前任务类型
         self.task_sub = rospy.Subscriber("/current_task", String, self.task_callback)
@@ -86,7 +93,7 @@ class ObjectDetector:
         # 订阅摄像头图像
         rospy.Subscriber("/detect/raw_image", Image, self.image_callback, queue_size=1)
         
-        rospy.loginfo("物体识别节点启动完成 - YOLOv11智能评分模式")
+        rospy.loginfo("物体识别节点启动完成 - YOLOv11智能评分模式 + 异步重置机制")
 
     def load_model(self):
         """加载模型 - 使用YOLO11官方API"""
@@ -134,10 +141,24 @@ class ObjectDetector:
             cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
             self.frame_counter += 1
             
+            # 在检测前进行智能历史清理
+            self.clean_publish_history()
+            
             self.detection_pipeline(cv_image, self.frame_counter)
             
         except Exception as e:
             rospy.logwarn("图像回调异常: {}".format(e))
+
+    def clean_publish_history(self):
+        """智能清理话题发布历史记录"""
+        current_time = time.time()
+        
+        # 清理策略：按数量限制清理（最旧优先）
+        if len(self.published_objects_topic) > self.max_history_size:
+            # 找到最旧的记录并删除
+            oldest_obj = min(self.published_objects_topic.items(), key=lambda x: x[1])[0]
+            del self.published_objects_topic[oldest_obj]
+            rospy.loginfo("📭 按数量限制清理最旧记录: {}".format(oldest_obj))
 
     def detection_pipeline(self, frame, frame_id):
         """检测流水线 - 适配YOLO11推理逻辑"""
@@ -203,7 +224,13 @@ class ObjectDetector:
         if current_frame_detections and not self.service_called:
             best_detection = self.select_best_detection(current_frame_detections)
             if best_detection:
-                rospy.loginfo("评分选择发布: {} (置信度: {:.3f})".format(
+                # 话题发布历史检查：检查是否已发布过
+                if best_detection['object'] in self.published_objects_topic:
+                    rospy.logdebug("🚫 话题跳过已发布物品: {} (置信度: {:.3f})".format(
+                        best_detection['object'], best_detection['confidence']))
+                    return
+                
+                rospy.loginfo("📢 话题发布: {} (置信度: {:.3f})".format(
                     best_detection['object'], best_detection['confidence']))
                 self.publish_object_detected(best_detection['object'])
 
@@ -262,7 +289,7 @@ class ObjectDetector:
             return None
 
     def publish_object_detected(self, object_name):
-        """发布物体检测信号 - 添加发布频率限制"""
+        """发布物体检测信号 - 添加发布频率限制和历史记录"""
         current_time = time.time()
         
         # 发布频率限制：至少间隔1秒
@@ -278,16 +305,23 @@ class ObjectDetector:
             self.object_detected_pub.publish(msg)
             self.last_publish_time = current_time
             
-            rospy.loginfo("发布物体检测信号: {}".format(object_name))
+            # 记录话题发布历史（带时间戳）
+            if object_name:
+                self.published_objects_topic[object_name] = current_time
+                rospy.loginfo("📝 记录话题发布物品: {} (历史数量: {})".format(
+                    object_name, len(self.published_objects_topic)))
+            
+            rospy.loginfo("✅ 发布物体检测信号: {}".format(object_name))
             
         except Exception as e:
             rospy.logwarn("物体检测信号发布异常: {}".format(e))
 
     def handle_object_service(self, req):
-        """服务处理 - 严格符合状态机要求"""
+        """服务处理 - 严格符合状态机要求，无历史检查"""
         rospy.loginfo("=== 收到识别请求 ===")
         rospy.loginfo("当前任务: {}".format(self.current_task))
         rospy.loginfo("检测历史长度: {}".format(len(self.detection_history)))
+        rospy.loginfo("话题已发布物品: {}".format(list(self.published_objects_topic.keys())))
         
         response = TriggerResponse()
         response.success = True
@@ -313,7 +347,7 @@ class ObjectDetector:
                 response.message = "NO_OBJECT_DETECTED"
                 return response
             
-            # 统计物体频率
+            # 统计物体频率 - 关键修改：服务调用无历史检查
             object_stats = {}
             for det in recent_detections:
                 obj = det['object']
@@ -323,7 +357,7 @@ class ObjectDetector:
                 object_stats[obj]['count'] += 1
                 object_stats[obj]['max_confidence'] = max(object_stats[obj]['max_confidence'], det['confidence'])
             
-            rospy.loginfo("物体频率统计: {}".format(
+            rospy.loginfo("服务物体频率统计: {}".format(
                 {obj: f"{stats['count']}次(置信度{stats['max_confidence']:.2f})" 
                 for obj, stats in object_stats.items()}))
             
@@ -336,7 +370,7 @@ class ObjectDetector:
                 count = stats['count']
                 max_conf = stats['max_confidence']
                 
-                rospy.loginfo("最佳物体: {} (类别: {}, 出现次数: {}, 最高置信度: {:.3f})".format(
+                rospy.loginfo("服务最佳物体: {} (类别: {}, 出现次数: {}, 最高置信度: {:.3f})".format(
                     obj_name, category, count, max_conf))
                 
                 # 关键修改：严格符合状态机要求
@@ -346,18 +380,18 @@ class ObjectDetector:
                         rospy.logwarn("任务不匹配: 需要 {}, 检测到 {}".format(self.current_task, category))
                     else:
                         response.message = obj_name
-                        rospy.loginfo("确认物体: {}".format(obj_name))
+                        rospy.loginfo("服务确认物体: {}".format(obj_name))
                         self.session_active = False
                 elif count >= 2:  # 或者2次较低置信度检测
                     if self.current_task and category != self.current_task:
                         response.message = "WARN:" + obj_name
                     else:
                         response.message = obj_name
-                        rospy.loginfo("确认物体: {} (基于多次检测)".format(obj_name))
+                        rospy.loginfo("服务确认物体: {} (基于多次检测)".format(obj_name))
                         self.session_active = False
                 else:
                     response.message = "CONTINUE_DETECTING"
-                    rospy.loginfo("继续检测: {} ({}/{}次, 置信度{:.3f})".format(
+                    rospy.loginfo("服务继续检测: {} ({}/{}次, 置信度{:.3f})".format(
                         obj_name, count, 2, max_conf))
             else:
                 response.message = "NO_OBJECT_DETECTED"
@@ -376,26 +410,38 @@ class ObjectDetector:
             rospy.loginfo("=== 服务处理完成 ===")
 
     def handle_reset_service(self, req):
-        """重置服务 - 只清空历史，保持检测能力"""
-        rospy.loginfo("=== 清空视觉历史数据 ===")
+        """重置服务 - 清空所有历史数据并发布完成信号"""
+        rospy.loginfo("=== 收到重置请求，开始清空视觉历史数据 ===")
         
-        # 只清空历史统计数据和会话状态
-        self.session_active = False
-        self.detection_history.clear()  # 清空长期历史
-        self.service_called = False
-        self.frame_counter = 0
-        
-        # 重要：保持实时检测能力，不重置模型状态
-        
-        # 发布空检测信号
-        self.publish_object_detected("")
-        
-        response = TriggerResponse()
-        response.success = True
-        response.message = "视觉历史数据已清空，检测能力保持"
-        
-        rospy.loginfo("历史数据清空完成，模型保持热状态")
-        return response
+        try:
+            # 清空所有状态
+            self.session_active = False
+            self.detection_history.clear()  # 清空检测历史
+            self.published_objects_topic.clear()  # 清空话题发布历史
+            self.service_called = False
+            self.frame_counter = 0
+            
+            # 重要：保持实时检测能力，不重置模型状态
+            
+            # 发布空检测信号
+            self.publish_object_detected("")
+            
+            # 新增：发布重置完成信号
+            self.reset_complete_pub.publish("reset_complete")
+            
+            response = TriggerResponse()
+            response.success = True
+            response.message = "视觉历史数据和发布记录已完全清空"
+            
+            rospy.loginfo("✅ 视觉状态完全重置完成，已发送完成信号")
+            return response
+            
+        except Exception as e:
+            rospy.logerr("重置服务处理异常: {}".format(e))
+            response = TriggerResponse()
+            response.success = False
+            response.message = "重置失败: {}".format(str(e))
+            return response
 
     def run(self):
         """主循环"""
