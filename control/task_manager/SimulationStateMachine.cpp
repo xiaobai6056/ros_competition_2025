@@ -2,6 +2,12 @@
 #include <sstream>
 #include <cmath>
 
+// 常量定义
+// 常量定义 - 确保只在头文件中声明，在cpp中定义
+constexpr float SimulationStateMachine::DISTANCE_THRESHOLD;
+constexpr float SimulationStateMachine::YAW_THRESHOLD;
+constexpr int SimulationStateMachine::VISUAL_TIMEOUT;
+
 SimulationStateMachine::SimulationStateMachine(ros::NodeHandle& nh) 
     : nh_(nh), 
       current_state_(SimulationState::INIT),
@@ -12,7 +18,8 @@ SimulationStateMachine::SimulationStateMachine(ros::NodeHandle& nh)
       room_b_checked_(false),
       room_c_checked_(false),
       navigation_in_progress_(false),
-      target_object_("") {
+      target_task_(""),
+      original_pose_saved_(false) {
     
     // 等待action server
     ROS_INFO("仿真状态机: 等待move_base action server...");
@@ -25,12 +32,14 @@ SimulationStateMachine::SimulationStateMachine(ros::NodeHandle& nh)
     // 初始化发布器和订阅器
     tts_publisher_ = nh_.advertise<std_msgs::String>("/tts", 1);
     cmd_vel_pub_ = nh_.advertise<geometry_msgs::Twist>("/cmd_vel", 1);
-    visual_sub_ = nh_.subscribe("/simulation_object_detected", 1, &SimulationStateMachine::visualCallback, this);
     
-    // 新增：订阅开始指令话题
-    start_sub_ = nh_.subscribe("/simulation_start", 1, &SimulationStateMachine::startCallback, this);
+    // 修正：使用正确的回调函数绑定
+    visual_sub_ = nh_.subscribe("/simulation_object_detected", 1, 
+                               &SimulationStateMachine::visualCallback, this);
     
-    // 新增：发布结果话题
+    // 开始指令订阅器和结果发布器
+    start_sub_ = nh_.subscribe("/simulation_start", 1, 
+                              &SimulationStateMachine::startCallback, this);
     result_pub_ = nh_.advertise<std_msgs::String>("/simulation_result", 1);
     
     // 初始化服务客户端
@@ -43,8 +52,13 @@ SimulationStateMachine::SimulationStateMachine(ros::NodeHandle& nh)
 }
 
 void SimulationStateMachine::startCallback(const std_msgs::String::ConstPtr& msg) {
-    target_object_ = msg->data;
-    ROS_INFO("收到仿真开始指令，目标物品: %s", target_object_.c_str());
+    target_task_ = msg->data;
+    ROS_INFO("收到仿真开始指令，任务类型: %s", target_task_.c_str());
+    
+    // 保存起始位置
+    if (!original_pose_saved_) {
+        saveOriginalPose();
+    }
     
     // 如果状态机还没开始，就启动
     if (current_state_ == SimulationState::INIT) {
@@ -55,7 +69,7 @@ void SimulationStateMachine::startCallback(const std_msgs::String::ConstPtr& msg
 void SimulationStateMachine::execute() {
     switch(current_state_) {
         case SimulationState::INIT: 
-            // 初始化状态，等待开始指令
+            handleInitState();
             break;
         case SimulationState::MOVE_TO_ROOM_A: handleMoveToRoomA(); break;
         case SimulationState::WAITING_VISUAL_A: handleWaitingVisualA(); break;
@@ -64,6 +78,7 @@ void SimulationStateMachine::execute() {
         case SimulationState::MOVE_TO_ROOM_C: handleMoveToRoomC(); break;
         case SimulationState::WAITING_VISUAL_C: handleWaitingVisualC(); break;
         case SimulationState::OBJECT_FOUND: handleObjectFound(); break;
+        case SimulationState::RETURN_TO_ORIGIN: handleReturnToOrigin(); break;
         case SimulationState::ALL_ROOMS_CHECKED: handleAllRoomsChecked(); break;
         case SimulationState::ERROR: handleErrorState(); break;
     }
@@ -72,13 +87,13 @@ void SimulationStateMachine::execute() {
 // ========== 状态处理函数 ==========
 
 void SimulationStateMachine::handleInitState() {
-    // 空实现，等待开始指令
+    ROS_INFO_THROTTLE(5, "[SIM_INIT] 等待仿真开始指令...");
 }
 
 void SimulationStateMachine::handleMoveToRoomA() {
     if (!room_a_checked_) {
-        ROS_INFO("[SIM_MOVE_TO_A] 前往A房间，目标物品: %s", target_object_.c_str());
-        speak("正在前往A房间，寻找" + target_object_);
+        ROS_INFO("[SIM_MOVE_TO_A] 前往A房间，任务类型: %s", target_task_.c_str());
+        speak("正在前往A房间，寻找" + target_task_);
         sendNavigationGoal("room_A");
         room_a_checked_ = true;
         current_room_ = "A";
@@ -93,13 +108,12 @@ void SimulationStateMachine::handleWaitingVisualA() {
     if (first_entered) {
         ROS_INFO("[SIM_WAITING_VISUAL_A] 到达A房间，开始视觉识别");
         enter_time = ros::Time::now();
-        wait_start_time = enter_time + ros::Duration(0.5); // 等待0.5秒后再调用视觉服务
+        wait_start_time = enter_time + ros::Duration(0.5);
         visual_service_called_ = false;
         first_entered = false;
         return;
     }
     
-    // 等待1.5秒后再调用视觉服务
     if (!visual_service_called_ && ros::Time::now() >= wait_start_time) {
         if (callVisualService()) {
             visual_service_called_ = true;
@@ -107,7 +121,6 @@ void SimulationStateMachine::handleWaitingVisualA() {
         return;
     }
     
-    // 检查超时（从进入状态开始计算）
     if ((ros::Time::now() - enter_time).toSec() > VISUAL_TIMEOUT) {
         ROS_WARN("[SIM_WAITING_VISUAL_A] A房间识别超时，前往B房间");
         speak("A房间未找到目标物品");
@@ -125,8 +138,8 @@ void SimulationStateMachine::handleWaitingVisualA() {
 
 void SimulationStateMachine::handleMoveToRoomB() {
     if (!room_b_checked_) {
-        ROS_INFO("[SIM_MOVE_TO_B] 前往B房间，目标物品: %s", target_object_.c_str());
-        speak("正在前往B房间，寻找" + target_object_);
+        ROS_INFO("[SIM_MOVE_TO_B] 前往B房间，任务类型: %s", target_task_.c_str());
+        speak("正在前往B房间，寻找" + target_task_);
         sendNavigationGoal("room_B");
         room_b_checked_ = true;
         current_room_ = "B";
@@ -141,7 +154,7 @@ void SimulationStateMachine::handleWaitingVisualB() {
     if (first_entered) {
         ROS_INFO("[SIM_WAITING_VISUAL_B] 到达B房间，开始视觉识别");
         enter_time = ros::Time::now();
-        wait_start_time = enter_time + ros::Duration(0.5); // 等待0.5秒后再调用视觉服务
+        wait_start_time = enter_time + ros::Duration(0.5);
         visual_service_called_ = false;
         first_entered = false;
         return;
@@ -171,8 +184,8 @@ void SimulationStateMachine::handleWaitingVisualB() {
 
 void SimulationStateMachine::handleMoveToRoomC() {
     if (!room_c_checked_) {
-        ROS_INFO("[SIM_MOVE_TO_C] 前往C房间，目标物品: %s", target_object_.c_str());
-        speak("正在前往C房间，寻找" + target_object_);
+        ROS_INFO("[SIM_MOVE_TO_C] 前往C房间，任务类型: %s", target_task_.c_str());
+        speak("正在前往C房间，寻找" + target_task_);
         sendNavigationGoal("room_C");
         room_c_checked_ = true;
         current_room_ = "C";
@@ -187,7 +200,7 @@ void SimulationStateMachine::handleWaitingVisualC() {
     if (first_entered) {
         ROS_INFO("[SIM_WAITING_VISUAL_C] 到达C房间，开始视觉识别");
         enter_time = ros::Time::now();
-        wait_start_time = enter_time + ros::Duration(0.5); // 等待0.5秒后再调用视觉服务
+        wait_start_time = enter_time + ros::Duration(0.5);
         visual_service_called_ = false;
         first_entered = false;
         return;
@@ -219,27 +232,39 @@ void SimulationStateMachine::handleObjectFound() {
     static bool announced = false;
     
     if (!announced) {
-        std::string result_message = "任务已完成，物品" + target_object_ + "在" + found_room_ + "房间";
+        std::string result_message = "找到" + found_object_ + "在" + found_room_ + "房间";
         ROS_INFO("[SIM_OBJECT_FOUND] %s", result_message.c_str());
-        speak("在" + found_room_ + "房间找到目标物品" + target_object_);
+        speak("在" + found_room_ + "房间找到" + found_object_);
         
-        // 发布结果给B服务端
-        publishResult(result_message);
         announced = true;
+        setState(SimulationState::RETURN_TO_ORIGIN);
     }
+}
+
+void SimulationStateMachine::handleReturnToOrigin() {
+    static bool goal_sent = false;
+    
+    if (!goal_sent) {
+        ROS_INFO("[SIM_RETURN_TO_ORIGIN] 返回起始位置");
+        speak("正在返回起始位置");
+        sendNavigationGoal("origin_point");
+        goal_sent = true;
+    }
+    
+    double time_in_state = (ros::Time::now() - state_start_time_).toSec();
+    ROS_INFO_THROTTLE(2, "[SIM_RETURN_TO_ORIGIN] 返回原点中... 已耗时: %.1f 秒", time_in_state);
 }
 
 void SimulationStateMachine::handleAllRoomsChecked() {
     static bool announced = false;
     
     if (!announced) {
-        std::string result_message = "任务完成，未找到物品" + target_object_;
+        std::string result_message = "未找到" + target_task_ + "类物品";
         ROS_WARN("[SIM_ALL_ROOMS_CHECKED] %s", result_message.c_str());
         speak("所有房间都未找到目标物品");
         
-        // 发布结果给B服务端
-        publishResult(result_message);
         announced = true;
+        setState(SimulationState::RETURN_TO_ORIGIN);
     }
 }
 
@@ -251,9 +276,48 @@ void SimulationStateMachine::handleErrorState() {
         ROS_ERROR("[SIM_ERROR] %s", result_message.c_str());
         speak("仿真任务出现错误");
         
-        // 发布错误结果给B服务端
         publishResult(result_message);
         announced = true;
+    }
+}
+
+// ========== 视觉服务调用 ==========
+
+bool SimulationStateMachine::callVisualService() {
+    std_srvs::Trigger srv;
+    if (visual_service_client_.call(srv)) {
+        if (srv.response.success) {
+            std::string response_message = srv.response.message;
+            ROS_INFO("仿真视觉服务返回: %s", response_message.c_str());
+            
+            if (response_message.find("WARN:") == 0) {
+                std::string mismatched_object = response_message.substr(5);
+                ROS_WARN("仿真任务在%s房间识别到不匹配物品: %s，继续检查", 
+                         current_room_.c_str(), mismatched_object.c_str());
+                return true;
+                
+            } else if (response_message == "NO_OBJECT_DETECTED") {
+                ROS_WARN("仿真任务在%s房间未检测到任何物体，等待超时", current_room_.c_str());
+                return false;
+                
+            } else if (response_message == "CONTINUE_DETECTING") {
+                ROS_INFO("仿真任务在%s房间视觉系统正在检测中", current_room_.c_str());
+                return false;
+                
+            } else {
+                // 找到匹配的目标物品，存储纯净的物品名
+                found_object_ = response_message;
+                found_room_ = current_room_;
+                setState(SimulationState::OBJECT_FOUND);
+                return true;
+            }
+        } else {
+            ROS_WARN("仿真视觉识别失败: %s", srv.response.message.c_str());
+            return false;
+        }
+    } else {
+        ROS_ERROR("仿真任务无法调用视觉服务");
+        return false;
     }
 }
 
@@ -264,15 +328,14 @@ void SimulationStateMachine::navFeedbackCallback(const move_base_msgs::MoveBaseF
                      feedback->base_position.pose.position.x,
                      feedback->base_position.pose.position.y);
     
-    // 智能停止：针对所有固定导航点
     switch(current_state_) {
         case SimulationState::MOVE_TO_ROOM_A:
         case SimulationState::MOVE_TO_ROOM_B:
         case SimulationState::MOVE_TO_ROOM_C:
+        case SimulationState::RETURN_TO_ORIGIN:
             handleFixedPointNavigationStop(feedback);
             break;
         default:
-            // 其他状态不需要智能停止
             break;
     }
 }
@@ -285,25 +348,21 @@ void SimulationStateMachine::handleFixedPointNavigationStop(const move_base_msgs
     
     geometry_msgs::Pose target_pose = it->second.pose;
     
-    // 计算距离
     float dx = feedback->base_position.pose.position.x - target_pose.position.x;
     float dy = feedback->base_position.pose.position.y - target_pose.position.y;
     float distance = sqrt(dx*dx + dy*dy);
     
-    // 计算角度差
     float target_yaw = getYawFromPose(target_pose);
     float current_yaw = getYawFromPose(feedback->base_position.pose);
     float yaw_diff = fabs(current_yaw - target_yaw);
     if (yaw_diff > M_PI) yaw_diff = 2 * M_PI - yaw_diff;
     
-    // 检查是否满足容差
     if (distance <= DISTANCE_THRESHOLD && yaw_diff <= YAW_THRESHOLD) {
         ROS_INFO("仿真到达 %s 位置！主动停止导航 (距离: %.3fm, 角度差: %.1f°)", 
                  current_goal_point_.c_str(), distance, yaw_diff * 180 / M_PI);
         action_client_.cancelAllGoals();
         stopMoving();
         
-        // 状态切换
         navigation_in_progress_ = false;
         triggerStateTransition(current_goal_point_);
     }
@@ -316,11 +375,161 @@ void SimulationStateMachine::triggerStateTransition(const std::string& goal_name
         setState(SimulationState::WAITING_VISUAL_B);
     } else if (goal_name == "room_C") {
         setState(SimulationState::WAITING_VISUAL_C);
+    } else if (goal_name == "origin_point") {
+        publishFinalResult();
     } else {
         ROS_WARN("仿真的未知目标点 %s，无法触发状态转换", goal_name.c_str());
     }
 }
 
+// ========== 保存和返回原点功能 ==========
+
+void SimulationStateMachine::saveOriginalPose() {
+    float x, y, yaw;
+    if (getRobotPose(x, y, yaw)) {
+        original_pose_ = createPose(x, y, yaw);
+        original_pose_saved_ = true;
+        ROS_INFO("保存起始位置: (%.2f, %.2f, %.1f°)", x, y, yaw * 180 / M_PI);
+        
+        navigation_points_["origin_point"] = original_pose_;
+    } else {
+        ROS_WARN("无法获取机器人位姿，使用默认原点");
+        original_pose_ = createPose(0.0, 0.0, 0.0);
+        original_pose_saved_ = true;
+        navigation_points_["origin_point"] = original_pose_;
+    }
+}
+
+bool SimulationStateMachine::getRobotPose(float& x, float& y, float& yaw) {
+    try {
+        geometry_msgs::TransformStamped transform;
+        transform = tf_buffer_.lookupTransform("map", "base_footprint", ros::Time(0), ros::Duration(0.1));
+        
+        x = transform.transform.translation.x;
+        y = transform.transform.translation.y;
+        
+        tf2::Quaternion q(
+            transform.transform.rotation.x,
+            transform.transform.rotation.y,
+            transform.transform.rotation.z,
+            transform.transform.rotation.w
+        );
+        tf2::Matrix3x3 m(q);
+        double roll, pitch, yaw_temp;
+        m.getRPY(roll, pitch, yaw_temp);
+        yaw = yaw_temp;
+        
+        return true;
+    }
+    catch (tf2::TransformException &ex) {
+        ROS_WARN_THROTTLE(5, "TF变换获取失败: %s", ex.what());
+        return false;
+    }
+}
+
+// ========== 结果发布逻辑 ==========
+
+void SimulationStateMachine::publishFinalResult() {
+    std::string result_message;
+    
+    if (current_state_ == SimulationState::OBJECT_FOUND) {
+        // ✅ 返回纯净的物品名给B服务端
+        result_message = found_object_;
+        ROS_INFO("[SIM_FINAL_RESULT] 找到目标物品: %s，在%s房间", 
+                 found_object_.c_str(), found_room_.c_str());
+    } else if (current_state_ == SimulationState::ALL_ROOMS_CHECKED) {
+        result_message = "未找到" + target_task_ + "类物品";
+        ROS_WARN("[SIM_FINAL_RESULT] %s", result_message.c_str());
+    } else {
+        result_message = "仿真任务执行完成";
+        ROS_INFO("[SIM_FINAL_RESULT] %s", result_message.c_str());
+    }
+    
+    speak("仿真任务完成");
+    
+    // 发布最终结果给B服务端
+    publishResult(result_message);
+    
+    // 重置状态机
+    resetStateMachine();
+}
+
+void SimulationStateMachine::publishResult(const std::string& result) {
+    std_msgs::String msg;
+    msg.data = result;
+    result_pub_.publish(msg);
+    ROS_INFO("发布仿真结果给B服务端: %s", result.c_str());
+}
+
+void SimulationStateMachine::resetStateMachine() {
+    room_a_checked_ = false;
+    room_b_checked_ = false;
+    room_c_checked_ = false;
+    visual_service_called_ = false;
+    navigation_in_progress_ = false;
+    found_object_ = "";
+    found_room_ = "";
+    target_task_ = "";
+    
+    setState(SimulationState::INIT);
+    ROS_INFO("仿真状态机已重置，等待下一次任务");
+}
+
+// ========== 导航回调函数 ==========
+
+void SimulationStateMachine::navDoneCallback(const actionlib::SimpleClientGoalState& state,
+                                            const move_base_msgs::MoveBaseResultConstPtr& result) {
+    navigation_in_progress_ = false;
+
+    ROS_INFO("仿真导航完成回调 - 状态: %s, 目标点: %s", 
+             state.toString().c_str(), current_goal_point_.c_str());
+
+    if (state == actionlib::SimpleClientGoalState::SUCCEEDED) {
+        ROS_INFO("仿真导航目标成功到达: %s", current_goal_point_.c_str());
+        
+        if (current_goal_point_ == "origin_point") {
+            triggerStateTransition("origin_point");
+        } else {
+            ROS_WARN("仿真导航完成，但智能停止未触发，手动触发状态转换");
+            triggerStateTransition(current_goal_point_);
+        }
+        
+    } else {
+        if (state == actionlib::SimpleClientGoalState::PREEMPTED) {
+            ROS_INFO("仿真导航被取消: %s", state.getText().c_str());
+            return;
+        }
+        
+        ROS_ERROR("仿真导航目标失败: %s - %s", 
+                 state.toString().c_str(), state.getText().c_str());
+        setState(SimulationState::ERROR);
+    }
+}
+
+void SimulationStateMachine::navActiveCallback() {
+    ROS_INFO("仿真任务导航目标已激活: %s", current_goal_point_.c_str());
+}
+
+// ========== 视觉回调函数 ==========
+
+void SimulationStateMachine::visualCallback(const std_msgs::String::ConstPtr& msg) {
+    std::string detected_object = msg->data;
+    
+    if (detected_object.empty()) {
+        return;
+    }
+    
+    ROS_INFO("仿真任务收到视觉检测: %s", detected_object.c_str());
+    
+    // 如果检测到目标物品，直接处理
+    // 注意：这里需要根据实际情况调整逻辑
+    if (!target_task_.empty()) {
+        // 可以添加任务匹配逻辑
+        found_object_ = detected_object;
+        found_room_ = current_room_;
+        setState(SimulationState::OBJECT_FOUND);
+    }
+}
 // ========== 工具函数 ==========
 
 void SimulationStateMachine::setState(SimulationState new_state) {
@@ -328,6 +537,7 @@ void SimulationStateMachine::setState(SimulationState new_state) {
              static_cast<int>(current_state_), 
              static_cast<int>(new_state));
     current_state_ = new_state;
+    state_start_time_ = ros::Time::now();
 }
 
 void SimulationStateMachine::sendNavigationGoal(const std::string& point_name) {
@@ -368,124 +578,10 @@ void SimulationStateMachine::speak(const std::string& text) {
     ROS_INFO("仿真语音播报: %s", text.c_str());
 }
 
-bool SimulationStateMachine::callVisualService() {
-    std_srvs::Trigger srv;
-    if (visual_service_client_.call(srv)) {
-        if (srv.response.success) {
-            std::string detected_object = srv.response.message;
-            ROS_INFO("仿真视觉服务返回: %s", detected_object.c_str());
-            
-            if (detected_object == target_object_) {
-                // 找到目标物品
-                found_room_ = current_room_;
-                setState(SimulationState::OBJECT_FOUND);
-                return true;
-            } else if (detected_object == "NO_OBJECT_DETECTED") {
-                // 关键修复：没有检测到物体，等待超时后前往下一个房间
-                ROS_WARN("仿真任务在%s房间未检测到任何物体，等待超时", current_room_.c_str());
-                // 不立即跳转，让超时机制处理
-                return false;
-            } else {
-                // 识别到明确的非目标物品，立即前往下一个房间
-                ROS_WARN("仿真任务在%s房间识别到非目标物品: %s，立即前往下一个房间", 
-                         current_room_.c_str(), detected_object.c_str());
-                speak(current_room_ + "房间找到非目标物品" + detected_object);
-                moveToNextRoom();
-                return true;
-            }
-        } else {
-            ROS_WARN("仿真视觉识别失败: %s", srv.response.message.c_str());
-            return false;
-        }
-    } else {
-        ROS_ERROR("仿真任务无法调用视觉服务");
-        return false;
-    }
-}
-
-void SimulationStateMachine::moveToNextRoom() {
-    if (!room_b_checked_) {
-        setState(SimulationState::MOVE_TO_ROOM_B);
-    } else if (!room_c_checked_) {
-        setState(SimulationState::MOVE_TO_ROOM_C);
-    } else {
-        setState(SimulationState::ALL_ROOMS_CHECKED);
-    }
-}
-
-// 新增：发布结果给B服务端
-void SimulationStateMachine::publishResult(const std::string& result) {
-    std_msgs::String msg;
-    msg.data = result;
-    result_pub_.publish(msg);
-    ROS_INFO("发布仿真结果给B服务端: %s", result.c_str());
-}
-
-// ========== 回调函数 ==========
-
-void SimulationStateMachine::navDoneCallback(const actionlib::SimpleClientGoalState& state,
-                                            const move_base_msgs::MoveBaseResultConstPtr& result) {
-    navigation_in_progress_ = false;
-
-    ROS_INFO("仿真导航完成回调 - 状态: %s, 目标点: %s", 
-             state.toString().c_str(), current_goal_point_.c_str());
-
-    // 如果当前状态已经不是导航状态，忽略这个回调
-    if (current_state_ != SimulationState::MOVE_TO_ROOM_A &&
-        current_state_ != SimulationState::MOVE_TO_ROOM_B &&
-        current_state_ != SimulationState::MOVE_TO_ROOM_C) {
-        ROS_INFO("仿真忽略导航回调，当前状态 %d 不是导航状态", static_cast<int>(current_state_));
-        return;
-    }
-
-    if (state == actionlib::SimpleClientGoalState::SUCCEEDED) {
-        ROS_INFO("仿真导航目标成功到达: %s", current_goal_point_.c_str());
-        
-        // 正常情况下，智能停止应该已经处理了状态转换
-        // 如果走到这里，说明智能停止没触发
-        ROS_WARN("仿真导航完成，但智能停止未触发，手动触发状态转换");
-        triggerStateTransition(current_goal_point_);
-        
-    } else {
-        // 特别处理被取消的情况
-        if (state == actionlib::SimpleClientGoalState::PREEMPTED) {
-            ROS_INFO("仿真导航被取消: %s", state.getText().c_str());
-            // 如果是被智能停止取消，这是正常行为
-            return;
-        }
-        
-        ROS_ERROR("仿真导航目标失败: %s - %s", 
-                 state.toString().c_str(), state.getText().c_str());
-        setState(SimulationState::ERROR);
-    }
-}
-
-void SimulationStateMachine::navActiveCallback() {
-    ROS_INFO("仿真任务导航目标已激活: %s", current_goal_point_.c_str());
-}
-
-void SimulationStateMachine::visualCallback(const std_msgs::String::ConstPtr& msg) {
-    std::string detected_object = msg->data;
-    
-    if (detected_object.empty()) {
-        return;
-    }
-    
-    ROS_INFO("仿真任务收到视觉检测: %s", detected_object.c_str());
-    
-    // 如果检测到目标物品，直接处理
-    if (detected_object == target_object_) {
-        found_room_ = current_room_;
-        setState(SimulationState::OBJECT_FOUND);
-    }
-    // 注意：非目标物品的处理在服务调用中已经处理
-}
-
 // ========== 导航点配置 ==========
 
 void SimulationStateMachine::loadNavigationPoints() {
-    // 使用与主任务相同的房间坐标
-    navigation_points_["room_A"] = createPose(3.6, 0.96, 1.57);
+    navigation_points_["room_A"] = createPose(3.85, 1.10, 1.57);
     navigation_points_["room_B"] = createPose(2.69, 0.868, 2.28);
     navigation_points_["room_C"] = createPose(0.51, 1.02, 1.57);
     
@@ -519,3 +615,4 @@ float SimulationStateMachine::getYawFromPose(const geometry_msgs::Pose& pose) {
     m.getRPY(roll, pitch, yaw);
     return yaw;
 }
+
