@@ -442,8 +442,6 @@ void NavigationStateMachine::handleWaitingVisual() {
     static ros::Time wait_start_time;
     static ros::Time detection_start_time;
     static bool initial_delay_passed = false;
-    static std::string last_detected_object;
-    static int same_object_count = 0;
     
     if (first_entered) {
         ROS_INFO("[WAITING_VISUAL] 到达识别板位置，等待视觉系统稳定");
@@ -473,8 +471,6 @@ void NavigationStateMachine::handleWaitingVisual() {
         detection_start_time = ros::Time::now() + ros::Duration(1.5);
         first_entered = false;
         initial_delay_passed = false;
-        same_object_count = 0;
-        last_detected_object = "";
         return;
     }
     
@@ -505,29 +501,17 @@ void NavigationStateMachine::handleWaitingVisual() {
         
         if (current_object == "NO_OBJECT_DETECTED") {
             ROS_INFO_THROTTLE(2, "当前未检测到任何物体，继续等待...");
-            same_object_count = 0;
-            last_detected_object = "";
             ros::Duration(0.3).sleep();
             return;
         }
         
         if (current_object.find("WARN:") != 0) {
-            if (current_object == last_detected_object) {
-                same_object_count++;
-                ROS_INFO("持续检测到: %s, 连续计数: %d", current_object.c_str(), same_object_count);
-            } else {
-                same_object_count = 1;
-                last_detected_object = current_object;
-                ROS_INFO("检测到新物体: %s, 开始计数", current_object.c_str());
-            }
-            
-            if (same_object_count >= 3) {
-                ROS_INFO("物体识别确认: %s", current_object.c_str());
-                picked_object_ = current_object;
-                speak("识别到" + current_object);
-                setState(RobotState::OBJECT_CONFIRMED);
-                first_entered = true;
-            }
+            // 视觉节点已经完成稳定性检查，直接接受识别结果
+            ROS_INFO("视觉节点确认物体: %s", current_object.c_str());
+            picked_object_ = current_object;
+            speak("识别到" + current_object);
+            setState(RobotState::OBJECT_CONFIRMED);
+            first_entered = true;
         } else {
             std::string mismatched_object = current_object.substr(5);
             ROS_WARN("识别到不匹配物体: %s，立即切换到下一个识别板", mismatched_object.c_str());
