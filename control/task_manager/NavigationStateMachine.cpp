@@ -1475,6 +1475,12 @@ void NavigationStateMachine::navDoneCallback(const actionlib::SimpleClientGoalSt
     ROS_INFO("导航完成回调 - 状态: %s, 目标点: %s, 当前状态: %d", 
              state.toString().c_str(), current_goal_point_.c_str(), static_cast<int>(current_state_));
 
+    // 关键修改：对于中继点导航，忽略被替换目标的回调
+    if (following_waypoint_sequence_ && state == actionlib::SimpleClientGoalState::PREEMPTED) {
+        ROS_DEBUG("中继点导航中被替换的目标回调，忽略");
+        return;
+    }
+
     // 如果当前状态已经不是导航状态，忽略这个回调
     if (current_state_ != RobotState::MOVE_TO_QR_ZONE &&
         current_state_ != RobotState::MOVE_TO_PICK_ZONE &&
@@ -1494,7 +1500,7 @@ void NavigationStateMachine::navDoneCallback(const actionlib::SimpleClientGoalSt
                 setState(RobotState::WAITING_QR_SERVICE);
                 break;
             case RobotState::MOVE_TO_PICK_ZONE:
-                setState(RobotState::ROTATION_SCAN); // 修改为新的起始状态
+                setState(RobotState::ROTATION_SCAN);
                 break;
             case RobotState::MOVE_TO_WAIT_ZONE:
                 setState(RobotState::WAITING_SIMULATION);
@@ -1503,20 +1509,20 @@ void NavigationStateMachine::navDoneCallback(const actionlib::SimpleClientGoalSt
                 setState(RobotState::WAITING_TRAFFIC);
                 break;
             case RobotState::NAVIGATE_TO_FINISH:
-                // 中继点导航：如果还在序列中，忽略回调（由智能切换处理）
+                // 中继点导航完成
                 if (following_waypoint_sequence_) {
-                    ROS_INFO("忽略中继点导航回调（由智能切换处理）");
-                    return;  // 直接返回，不处理状态转换
+                    ROS_INFO("中继点导航序列完成");
+                    following_waypoint_sequence_ = false;
+                    setState(RobotState::TASK_COMPLETE);
                 } else {
-                    // 非中继点模式下的终点导航（备用逻辑）
+                    // 非中继点模式下的终点导航
                     ROS_INFO("成功到达终点: %s", current_goal_point_.c_str());
                     setState(RobotState::TASK_COMPLETE);
                 }
                 break;
             case RobotState::NAVIGATING_TO_BOARD:
                 // 正常情况下，NAVIGATING_TO_BOARD 应该由智能停止处理
-                // 如果走到这里，说明智能停止没触发，使用move_base的结果
-                ROS_WARN("NAVIGATING_TO_BOARD 导航完成，但智能停止未触发，使用move_base结果");
+                ROS_WARN("NAVIGATING_TO_BOARD 导航完成，但智能停止未触发");
                 moving_to_cluster_ = false;
                 setState(RobotState::WAITING_VISUAL);
                 break;
@@ -1533,7 +1539,6 @@ void NavigationStateMachine::navDoneCallback(const actionlib::SimpleClientGoalSt
             if (current_state_ == RobotState::NAVIGATING_TO_BOARD) {
                 ROS_INFO("识别板导航被智能停止取消，正常行为");
                 moving_to_cluster_ = false;
-                // 状态已经由智能停止设置了，不需要重复设置
                 return;
             }
             
@@ -1615,47 +1620,49 @@ void NavigationStateMachine::handleBoardNavigationStop(const move_base_msgs::Mov
 }
 
 void NavigationStateMachine::handleWaypointSwitching(const move_base_msgs::MoveBaseFeedbackConstPtr& feedback) {
-    if (current_waypoint_index_ >= waypoint_sequence_.size()) {
-        return;
-    }
-    
-    std::string current_target = waypoint_sequence_[current_waypoint_index_];
-    auto it = navigation_points_.find(current_target);
-    if (it == navigation_points_.end()) {
-        return;
-    }
-    
-    geometry_msgs::Pose target_pose = it->second.pose;
-    float dx = feedback->base_position.pose.position.x - target_pose.position.x;
-    float dy = feedback->base_position.pose.position.y - target_pose.position.y;
-    float distance = sqrt(dx*dx + dy*dy);
-    
-    bool should_switch = false;
-    
-    // 所有中继点都使用相同的宽松条件
-    if (distance <= waypoint_switch_distance_) {
-        should_switch = true;
-        ROS_INFO("到达中继点 %s 附近: 距离=%.3fm", current_target.c_str(), distance);
-    }
-    
-    if (should_switch) {
-        ROS_INFO("到达中继点 %s，准备切换到下一个目标", current_target.c_str());
+    if (following_waypoint_sequence_ && !waypoint_sequence_.empty()) {
+        if (current_waypoint_index_ >= waypoint_sequence_.size()) {
+            return;
+        }
         
-        // 如果是最后一个中继点，直接完成任务，不取消导航
-        if (current_waypoint_index_ == waypoint_sequence_.size() - 1) {
-            ROS_INFO("到达最终目标 %s，任务完成", current_target.c_str());
-            following_waypoint_sequence_ = false;
-            task_flags_.navigation_in_progress = false;
-            setState(RobotState::TASK_COMPLETE);
-        } else {
-            // 中间点：取消导航并切换到下一个
-            action_client_.cancelAllGoals();
-            ros::Duration(0.1).sleep();
+        std::string current_target = waypoint_sequence_[current_waypoint_index_];
+        auto it = navigation_points_.find(current_target);
+        if (it == navigation_points_.end()) {
+            return;
+        }
+        
+        geometry_msgs::Pose target_pose = it->second.pose;
+        float dx = feedback->base_position.pose.position.x - target_pose.position.x;
+        float dy = feedback->base_position.pose.position.y - target_pose.position.y;
+        float distance = sqrt(dx*dx + dy*dy);
+        
+        bool should_switch = false;
+        
+        // 所有中继点都使用相同的宽松条件
+        if (distance <= waypoint_switch_distance_) {
+            should_switch = true;
+            ROS_INFO("到达中继点 %s 附近: 距离=%.3fm", current_target.c_str(), distance);
+        }
+        
+        if (should_switch) {
+            ROS_INFO("到达中继点 %s，准备切换到下一个目标", current_target.c_str());
             
-            current_waypoint_index_++;
-            std::string next_target = waypoint_sequence_[current_waypoint_index_];
-            ROS_INFO("切换到下一个中继点: %s", next_target.c_str());
-            sendNavigationGoal(next_target);
+            // 如果是最后一个中继点，直接完成任务，不取消导航
+            if (current_waypoint_index_ == waypoint_sequence_.size() - 1) {
+                ROS_INFO("到达最终目标 %s，任务完成", current_target.c_str());
+                following_waypoint_sequence_ = false;
+                task_flags_.navigation_in_progress = false;
+                setState(RobotState::TASK_COMPLETE);
+            } else {
+                // 关键修改：直接发送新目标，不取消旧目标
+                // move_base会自动处理目标替换，这样更平滑
+                current_waypoint_index_++;
+                std::string next_target = waypoint_sequence_[current_waypoint_index_];
+                ROS_INFO("平滑切换到下一个中继点: %s", next_target.c_str());
+                
+                // 直接发送新目标，让move_base自动替换旧目标
+                sendNavigationGoal(next_target);
+            }
         }
     }
 }
@@ -1685,9 +1692,15 @@ void NavigationStateMachine::speak(const std::string& text) {
 void NavigationStateMachine::sendNavigationGoal(const std::string& point_name) {
     auto it = navigation_points_.find(point_name);
     if (it != navigation_points_.end()) {
-        if (task_flags_.navigation_in_progress) {
-            action_client_.cancelAllGoals();
-            ROS_INFO("取消之前的导航目标");
+        // 关键修改：只在特定情况下取消旧目标
+        // 对于中继点切换，不取消目标以获得更平滑的过渡
+        if (current_state_ != RobotState::NAVIGATE_TO_FINISH || 
+            !following_waypoint_sequence_) {
+            // 只有非中继点导航才取消旧目标
+            if (task_flags_.navigation_in_progress) {
+                action_client_.cancelAllGoals();
+                ROS_INFO("取消之前的导航目标");
+            }
         }
         
         move_base_msgs::MoveBaseGoal goal;
@@ -1749,8 +1762,8 @@ void NavigationStateMachine::loadNavigationPoints() {
     navigation_points_["pick_zone"] = createPose(1.7, 5.35, 0.0);
     navigation_points_["wait_zone"] = createPose(1.7, 6.34, 0.0);
     navigation_points_["traffic_zone"] = createPose(4.9, 6.4, 1.57); 
-    navigation_points_["intersection_A"] = createPose(4.2, 4.3, -1.57);
-    navigation_points_["intersection_B"] = createPose(7.3, 4.6, -1.57);
+    navigation_points_["intersection_A"] = createPose(4.9, 3.3, -1.57);
+    navigation_points_["intersection_B"] = createPose(6.37, 3.24, -1.57);
     navigation_points_["finish_zone_A"] = createPose(4.9, 0.4, -1.57);
     navigation_points_["finish_zone_B"] = createPose(6.5, 0.4, -1.57);
 
@@ -2134,4 +2147,3 @@ void NavigationStateMachine::printPurchaseDetails(double payment, double change)
     }
     ROS_INFO("==============================");
 }
-
