@@ -171,20 +171,16 @@ void NavigationStateMachine::handleMoveToQRZone() {
 }
 
 void NavigationStateMachine::handleWaitingQRService() {
-    if (!qr_service_called_) {
-        ROS_INFO("[WAITING_QR_SERVICE] 调用二维码识别服务");
-        ros::Duration(0.5).sleep();
-        if (callQRService()) {
-            qr_service_called_ = true;
-            service_call_time_ = ros::Time::now();
-        } else {
-            ROS_WARN("二维码服务调用失败，0.1秒后重试");
-            ros::Duration(0.1).sleep();
+   if (!qr_service_called_) {
+            ROS_INFO_THROTTLE(1.0, "[WAITING_QR_SERVICE] 持续识别二维码...");
+            
+            // 简单无限重试
+            if (callQRService()) {
+                qr_service_called_ = true;
+            } else {
+                ros::Duration(0.01).sleep(); // 避免CPU占用过高
+            }
         }
-    } else {
-        double time_in_state = (ros::Time::now() - state_start_time_).toSec();
-        ROS_INFO_THROTTLE(2, "[WAITING_QR_SERVICE] 等待二维码识别结果... 已耗时: %.1f 秒", time_in_state);
-    }
 }
 
 void NavigationStateMachine::handleMoveToPickZone() {
@@ -1389,7 +1385,6 @@ bool NavigationStateMachine::callQRService() {
             ROS_INFO("二维码服务返回: %s", current_task_.c_str());
             speak("本次采购任务为" + current_task_);
             
-            // 发布任务给其他节点
             std_msgs::String task_msg;
             task_msg.data = current_task_;
             task_pub_.publish(task_msg);
@@ -1398,11 +1393,12 @@ bool NavigationStateMachine::callQRService() {
             setState(RobotState::MOVE_TO_PICK_ZONE);
             return true;
         } else {
-            ROS_ERROR("二维码识别失败: %s", srv.response.message.c_str());
+            // 限制ERROR日志频率
+            ROS_ERROR_THROTTLE(0.5, "二维码识别失败: %s", srv.response.message.c_str());
             return false;
         }
     } else {
-        ROS_ERROR("无法调用二维码服务");
+        ROS_ERROR_THROTTLE(1.0, "无法调用二维码服务");
         return false;
     }
 }
